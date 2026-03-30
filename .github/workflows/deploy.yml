@@ -30,13 +30,13 @@ jobs:
         with:
           filters: |
             triage:
-              - 'triage_agent/**'
+              - 'agents/triage_agent/**'
             chat:
-              - 'chat_agent/**'
+              - 'agents/chat_agent/**'
             dispatch:
-              - 'dispatch_agent/**'
+              - 'agents/dispatch_agent/**'
             detector:
-              - 'anomaly_detector/**'
+              - 'agents/anomaly_detector/**'
 
   # ── Auth to GCP (shared setup) ─────────────────────────────────────────────
   # Each deploy job authenticates independently using the stored SA key.
@@ -59,7 +59,7 @@ jobs:
       - name: Deploy triage-agent
         run: |
           gcloud run deploy triage-agent \
-            --source ./triage_agent \
+            --source ./agents/triage_agent \
             --region $REGION \
             --project $PROJECT_ID \
             --service-account microgrid-agent@$PROJECT_ID.iam.gserviceaccount.com \
@@ -86,7 +86,7 @@ jobs:
       - name: Deploy chat-agent
         run: |
           gcloud run deploy chat-agent \
-            --source ./chat_agent \
+            --source ./agents/chat_agent \
             --region $REGION \
             --project $PROJECT_ID \
             --service-account microgrid-agent@$PROJECT_ID.iam.gserviceaccount.com \
@@ -113,7 +113,7 @@ jobs:
       - name: Deploy dispatch-agent
         run: |
           gcloud run deploy dispatch-agent \
-            --source ./dispatch_agent \
+            --source ./agents/dispatch_agent \
             --region $REGION \
             --project $PROJECT_ID \
             --service-account microgrid-agent@$PROJECT_ID.iam.gserviceaccount.com \
@@ -140,7 +140,7 @@ jobs:
       - name: Deploy anomaly-detector
         run: |
           gcloud run deploy anomaly-detector \
-            --source ./anomaly_detector \
+            --source ./agents/anomaly_detector \
             --region $REGION \
             --project $PROJECT_ID \
             --service-account microgrid-agent@$PROJECT_ID.iam.gserviceaccount.com \

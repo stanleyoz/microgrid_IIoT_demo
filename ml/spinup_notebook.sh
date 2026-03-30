@@ -1,9 +1,9 @@
 #!/bin/bash
 # spinup_notebook.sh — recreate the Vertex AI Workbench instance for model retraining
 #
-# Usage:
-#   ./spinup_notebook.sh                          # uses default anomaly_detection_poc.ipynb
-#   ./spinup_notebook.sh my_other_notebook.ipynb  # specify a different notebook file
+# Usage (run from project root or ml/ directory):
+#   ./ml/spinup_notebook.sh                          # uses default anomaly_detection_poc.ipynb
+#   ./ml/spinup_notebook.sh my_other_notebook.ipynb  # specify a different notebook file
 #
 # What it does:
 #   1. Stages your local .ipynb to GCS

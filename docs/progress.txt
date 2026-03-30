@@ -369,3 +369,53 @@ print(df_sorted.head())
   - "✓ ACK" primary button → POST `/ack` → `st.cache_data.clear()` → `st.rerun()`
 - **End-to-end confirmed:** `/ack` returns `{"status":"acknowledged"}`, Slack green card delivered ✓
 - **Full HITL loop:** anomaly → Haiku triage → Slack alert (orange/red) → operator sees dashboard banner → clicks ACK → BQ recorded + Slack green confirmation
+
+## Phase 21: GitHub CI/CD + Local Filesystem Restructure (Completed 2026-03-30)
+
+### GitHub Private Repository
+- **Repo:** https://github.com/stanleyoz/microgrid_IIoT_demo (private)
+- **Initial commit:** 36 files, full project history starts here
+- **Auth:** GitHub CLI (gh) authenticated as stanleyoz; PAT with repo+workflow scopes
+  used for pushing .github/workflows/ files (GitHub OAuth restriction)
+- **Secret stored:** GCP_SA_KEY — JSON key for dedicated github-deploy SA
+
+### GitHub Actions CI/CD Workflow (.github/workflows/deploy.yml)
+- **Trigger:** Push to main branch (path-filtered per service) + manual workflow_dispatch
+- **Path filters:** agents/anomaly_detector/**, agents/triage_agent/**, agents/chat_agent/**,
+  agents/dispatch_agent/** — only deploys the service whose files changed
+- **GCP SA:** github-deploy@microgrid-demo.iam.gserviceaccount.com
+  Roles: run.admin, cloudbuild.builds.editor, artifactregistry.writer,
+         storage.objectAdmin, iam.serviceAccountUser
+- **Outcome:** Push to main auto-deploys affected Cloud Run service (~3 min)
+  No more manual gcloud run deploy commands required
+
+### Vertex AI Workbench Cost Fix
+- Notebook instance microgrid-anomaly-detection-notebook was left running after
+  model training — accounted for ~50% of daily GCP bill (VM running 24/7)
+- Notebook downloaded locally as anomaly_detection_poc.ipynb before deletion
+- Instance deleted: gcloud workbench instances delete ...
+- ml/spinup_notebook.sh created for one-command recreation when retraining needed
+- Ongoing saving: ~$30-45/month
+
+### Local Filesystem Restructure
+Previous state: all files flat in project root — no separation of concerns.
+New structure:
+  agents/     — 4 Cloud Run microservices (anomaly_detector, triage_agent,
+                chat_agent, dispatch_agent)
+  dashboard/  — Streamlit app (dashboard_app.py, requirements.txt)
+  edge/       — Hardware gateway + simulator (sim_site.py, db2mqtt_microgrid.py,
+                docker-compose.yml, Dockerfile, ca.crt, SSH keys)
+  ml/         — Training notebook, generate_historical.py, spinup_notebook.sh
+  scripts/    — Operational scripts (check_GCP.sh)
+  docs/       — All documentation, plans, diagrams, progress.txt
+
+Files updated after restructure:
+  .github/workflows/deploy.yml — source paths updated to agents/*
+  CLAUDE.md                    — all run commands + paths updated
+  ml/spinup_notebook.sh        — usage comment updated
+
+Files deleted (confirmed junk):
+  Restart                      — empty file
+  anomaly_detection_poc.pdf    — generated artefact (notebook source kept)
+
+Reference doc: docs/setup_CICD_github_repo.txt — full CI/CD setup walkthrough
