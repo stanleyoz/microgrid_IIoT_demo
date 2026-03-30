@@ -1,0 +1,9 @@
+# Ignore data and logs from simulators
+data/
+logs/
+*.csv
+*.json
+build/
+dist/
+venv/
+.git/

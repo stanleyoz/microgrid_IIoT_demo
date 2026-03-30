@@ -1,0 +1,8 @@
+google-cloud-bigquery
+db-dtypes
+google-cloud-pubsub
+pandas
+streamlit
+plotly
+redis
+requests

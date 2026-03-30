@@ -1,0 +1,155 @@
+  What Needs to Change — and Why It's Non-Trivial
+
+  The core problem: Anthropic SDK and OpenAI API have different message/tool formats. The chat agent's LangGraph ReAct loop is tightly
+  coupled to Anthropic's response shape (resp.stop_reason, block.type == "tool_use", tool_use_id). A naive swap breaks everything.
+
+  The network problem: Triage and chat agents currently run on Cloud Run. Cloud Run can't reach localhost:11434. So when provider=ollama,
+  agents need to run locally as plain uvicorn processes.
+
+  ---
+  Proposed Architecture
+
+  model_config.json   ←── operator edits this, nothing else changes
+         │
+         ├── provider: "ollama"
+         │     triage_model: "qwen2.5:7b"
+         │     chat_model:   "qwen2.5:32b"
+         │     agent_urls:   localhost:8001 / localhost:8002
+         │
+         └── provider: "anthropic"
+               triage_model: "claude-haiku-4-5-20251001"
+               chat_model:   "claude-sonnet-4-6"
+               agent_urls:   Cloud Run URLs
+
+  The config drives three things: which LLM client to instantiate, which model name to pass, and which agent URL the dashboard calls.
+
+  ---
+  Files to Create / Modify
+
+  ┌───────────────────────────────┬───────────────────────────────────────────────────────────────────────────┐
+  │             File              │                                  Change                                   │
+  ├───────────────────────────────┼───────────────────────────────────────────────────────────────────────────┤
+  │ model_config.json             │ New — single source of truth for provider + models + URLs                 │
+  ├───────────────────────────────┼───────────────────────────────────────────────────────────────────────────┤
+  │ llm_client.py                 │ New — abstraction layer; normalises Anthropic ↔ OpenAI response shapes    │
+  ├───────────────────────────────┼───────────────────────────────────────────────────────────────────────────┤
+  │ triage_agent/main.py          │ Swap anthropic.Anthropic for LLMClient; small change (no tool use)        │
+  ├───────────────────────────────┼───────────────────────────────────────────────────────────────────────────┤
+  │ chat_agent/main.py            │ Swap anthropic.Anthropic for LLMClient; larger change (tool use loop)     │
+  ├───────────────────────────────┼───────────────────────────────────────────────────────────────────────────┤
+  │ triage_agent/requirements.txt │ Add openai                                                                │
+  ├───────────────────────────────┼───────────────────────────────────────────────────────────────────────────┤
+  │ chat_agent/requirements.txt   │ Add openai                                                                │
+  ├───────────────────────────────┼───────────────────────────────────────────────────────────────────────────┤
+  │ dashboard_app.py              │ Read CHAT_AGENT_URL and DISPATCH_AGENT_URL from config instead of env var │
+  ├───────────────────────────────┼───────────────────────────────────────────────────────────────────────────┤
+  │ run_local.sh                  │ New — starts both agents locally when provider=ollama                     │
+  └───────────────────────────────┴───────────────────────────────────────────────────────────────────────────┘
+
+  ---
+  The Abstraction Layer (llm_client.py)
+
+  The two formats that need normalising:
+
+  Anthropic                          OpenAI / Ollama
+  ─────────────────────────────────  ──────────────────────────────────
+  stop_reason == "tool_use"          finish_reason == "tool_calls"
+  content[].type == "tool_use"       message.tool_calls[]
+  block.id / block.name / block.input  .id / .function.name / .function.arguments (JSON str)
+  tool_result → role:"user"          tool result → role:"tool"
+  input_schema: {...}                parameters: {...}  (+ type:"function" wrapper)
+
+  llm_client.py exposes one class with two methods:
+  - chat(messages, system, tools=None, max_tokens) → normalised response
+  - extract_tool_calls(response) → list of {id, name, input} regardless of backend
+  - tool_result_message(tool_id, content) → correct message format for each backend
+
+  Both agents import from this — zero knowledge of which backend is in use.
+
+  ---
+  Model Recommendations for RTX 4090 (24GB)
+
+  You already have llama3.1:8b (4.9GB) — usable immediately for both agents while better models pull.
+
+  ┌─────────────────────┬─────────────┬────────┬───────────────────────────────────────────────────┐
+  │        Agent        │ Recommended │  VRAM  │                        Why                        │
+  ├─────────────────────┼─────────────┼────────┼───────────────────────────────────────────────────┤
+  │ Triage              │ qwen2.5:7b  │ ~4.7GB │ Best-in-class structured JSON output; fast; small │
+  ├─────────────────────┼─────────────┼────────┼───────────────────────────────────────────────────┤
+  │ Chat                │ qwen2.5:32b │ ~19GB  │ Best tool-use + reasoning that fits in 4090       │
+  ├─────────────────────┼─────────────┼────────┼───────────────────────────────────────────────────┤
+  │ Chat (conservative) │ qwen2.5:14b │ ~8.9GB │ Comfortable headroom to run both simultaneously   │
+  └─────────────────────┴─────────────┴────────┴───────────────────────────────────────────────────┘
+
+  Running both simultaneously: qwen2.5:7b + qwen2.5:32b = ~23.7GB — right at the limit with q4 quantisation. Safer to use qwen2.5:14b for
+  chat (13.6GB combined) with no risk of OOM.
+
+  Pull commands to run before we start:
+  ollama pull qwen2.5:7b
+  ollama pull qwen2.5:14b   # or qwen2.5:32b if you want to push the limit
+
+  ---
+  Triage Agent — Simpler Change
+
+  No tool use — just structured JSON generation. The only change:
+  # before
+  response = claude.messages.create(model=..., system=..., messages=[...])
+  raw = response.content[0].text
+
+  # after
+  response = llm.chat(messages=[...], system=..., max_tokens=512)
+  raw = response.text   # normalised by llm_client
+
+  For Ollama, add format="json" to force reliable structured output — Ollama supports this natively and it eliminates the markdown fence
+  stripping we already have.
+
+  ---
+  Chat Agent — More Involved
+
+  The ReAct loop currently inspects Anthropic-specific response attributes directly inside agent_node and tools_node. Those two functions
+  get refactored to use the normalised interface:
+
+  # agent_node: instead of checking resp.stop_reason and iterating resp.content blocks
+  tool_calls = llm.extract_tool_calls(resp)
+  if tool_calls:
+      # → tools node
+  else:
+      # → done
+
+  # tools_node: instead of building Anthropic tool_result dicts manually
+  results_msg = llm.tool_result_message(tool_id, result_content)
+
+  The LangGraph graph structure itself doesn't change — only the two node functions.
+
+  ---
+  Local Run Flow (when provider=ollama)
+
+  # Terminal 1 — Ollama (already running as service after install)
+  ollama serve   # if not already running
+
+  # Terminal 2 — agents
+  ./run_local.sh   # starts triage on :8002 and chat on :8001
+
+  # Terminal 3 — dashboard
+  streamlit run dashboard_app.py   # reads model_config.json, hits localhost URLs
+
+  The Pub/Sub → triage pipeline still runs on Cloud Run (Anthropic) unless you also want to test triage locally — in which case you POST
+  directly to http://localhost:8002/pubsub.
+
+  ---
+  What Doesn't Change
+
+  - All LangGraph graph structure (nodes, edges, state)
+  - All BigQuery tool implementations
+  - All FastAPI endpoints and request/response shapes
+  - Dispatch agent (no LLM, stays on Cloud Run)
+  - The anomaly-detector (sklearn, stays on Cloud Run)
+
+  ---
+  Ready to implement? I'd suggest this order:
+  1. model_config.json + llm_client.py
+  2. Triage agent (simpler, validate the abstraction)
+  3. Chat agent (tool use refactor)
+  4. Dashboard URL config
+  5. run_local.sh
+  6. Pull models + smoke test

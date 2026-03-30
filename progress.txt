@@ -1,0 +1,371 @@
+# Microgrid IIoT + Agentic AI Platform - Implementation Progress
+
+## Phase 1: Project & IAM Bootstrap (Completed)
+- **Project Created:** `microgrid-demo` (Display Name: Microgrid IIoT Demo)
+- **Billing Linked:** Linked account `011C0D-96CE16-159A72`
+- **APIs Enabled:** compute, pubsub, bigquery, run, aiplatform, redis
+- **Service Account:** Created `microgrid-agent@microgrid-demo.iam.gserviceaccount.com`
+- **IAM Bindings:**
+  - `microgrid-agent`: roles/bigquery.dataEditor, roles/pubsub.publisher, roles/pubsub.subscriber
+  - `service-633335742473@gcp-sa-pubsub.iam.gserviceaccount.com`: roles/bigquery.dataEditor
+
+## Phase 2: VM Setup (Completed)
+- **Instance:** `microgrid-broker` (e2-small, australia-southeast1-a)
+- **External IP:** `34.87.254.184`
+- **Firewall Rules:**
+  - `allow-mqtt-tls`: Port 8883 (target: mqtt-server)
+  - `allow-streamlit`: Port 8501 (target: http-server)
+
+## Phase 3: BigQuery Setup (Completed)
+- **Dataset Created:** `microgrid_db`
+- **Tables Created:**
+  - `microgrid_telemetry`: 17-field columnar schema for ML + `data` column
+  - `anomaly_events`: site_id, timestamp, score, fault, severity, summary, ack
+
+## Phase 4: Pub/Sub Setup (Completed)
+- **Topics:** `microgrid-telemetry`, `microgrid-anomalies`, `microgrid-agent-events`
+- **Subscriptions:**
+  - `bq-ingest-sub`: Raw telemetry push to BigQuery
+  - `anomaly-trigger-sub`: Raw telemetry push to ML scoring (placeholder endpoint)
+
+## Phase 5: VM Configuration (Completed)
+- **Mosquitto:** Installed and configured for TLS (port 8883) + password auth.
+- **TLS Certs:** Generated self-signed CA and server certificates.
+- **Device Auth:** Created credentials for `hw-node-01` and `site-01`.
+- **Redis:** Installed and running as fleet state cache.
+- **Bridge Script:** `mqtt_to_pubsub.py` installed and running as a systemd service (`mqtt-bridge`).
+
+## Phase 6: Hardware Test & End-to-End Validation (Completed)
+- **Gateway:** nodeG5/nodeMINI connected successfully via TLS (8883).
+- **MQTT Connectivity:** Verified for `hw-node-01` with `node-pass-secret` authentication.
+- **Bridge Processing:** `mqtt-bridge` successfully routing messages from MQTT to Pub/Sub.
+- **Data Ingestion:** Confirmed flow into BigQuery table `microgrid_telemetry`.
+- **Schema Mapping:** Resolved BigQuery mapping issue by updating `bq-ingest-sub` to use `--use-table-schema`.
+- **Status:** End-to-End proof of concept validated with real hardware telemetry.
+
+## Phase 7: Simulator Verification & Data Understanding (Completed)
+- **Simulator Location:** Confirmed `sim_site.py` instances are running locally on the dev machine, sending data to the `microgrid-broker` VM.
+- **`sim_site.py` Review:** Code reviewed to understand data generation and MQTT publishing mechanisms.
+- **BigQuery Schema Retrieval:** Retrieved `microgrid_telemetry` table schema.
+- **BigQuery Data Sampling:** Sampled 100 recent rows from `microgrid_telemetry` to understand data distribution and content.
+
+## Phase 8: ML Environment Setup and Feature Engineering (Completed)
+- **Objective:** Set up a Vertex AI Workbench environment for ML development.
+- **Vertex AI Workbench Instance:** Created `microgrid-anomaly-detection-notebook` (e2-standard-2) in `australia-southeast1-a`.
+
+### Next Steps: Access Notebook and Initial Code Generation
+
+You can access your Vertex AI Workbench instance by navigating to the following URL in your browser:
+
+[https://console.cloud.google.com/vertex-ai/workbench/instances/list?project=microgrid-demo&_Actions=launch_jupyterlab](https://console.cloud.google.com/vertex-ai/workbench/instances/list?project=microgrid-demo&_Actions=launch_jupyterlab)
+
+Once in JupyterLab, you will want to create a new notebook (e.g., `anomaly_detection_poc.ipynb`).
+
+Here is the initial Python code you can use in your new notebook to connect to BigQuery and fetch a sample of the `microgrid_telemetry` data for feature engineering:
+
+```python
+import pandas as pd
+from google.cloud import bigquery
+import google.auth # Import google.auth
+
+# --- Configuration ---
+PROJECT_ID = 'microgrid-demo'
+DATASET_ID = 'microgrid_db'
+TABLE_ID = 'microgrid_telemetry'
+LOCATION = 'australia-southeast1' # BigQuery dataset location (region)
+
+# Initialize BigQuery client
+# Explicitly fetch credentials and pass them to the client
+credentials, default_project_id = google.auth.default()
+client = bigquery.Client(project=PROJECT_ID, credentials=credentials)
+
+# --- Fetch Data from BigQuery ---
+# This query fetches the latest 1000 records from the telemetry table
+# You might adjust this based on your data volume and processing needs.
+query = f"""
+SELECT
+    timestamp,
+    site_id,
+    battery_v,
+    battery_soc,
+    battery_current,
+    battery_temp,
+    ac_input_v,
+    ac_output_v,
+    ac_output_i,
+    ac_input_power,
+    ac_output_power,
+    solar_w,
+    load_w,
+    inverter_state,
+    inverter_temp,
+    fault_code,
+    power_balance_w
+FROM
+    `{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}`
+ORDER BY
+    timestamp DESC
+LIMIT 1000
+"""
+
+# Run the query and load results into a Pandas DataFrame
+try:
+    df = client.query(query).to_dataframe()
+    print(f"Successfully fetched {len(df)} records from BigQuery.")
+    print("
+DataFrame head:")
+    print(df.head())
+    print("
+DataFrame info:")
+    df.info()
+
+except Exception as e:
+    print(f"An error occurred: {e}")
+
+# --- Basic Feature Engineering (Example) ---
+# Convert timestamp to datetime objects and set as index
+df['timestamp'] = pd.to_datetime(df['timestamp'])
+df = df.set_index('timestamp')
+
+# Sort by timestamp (important for time-series operations)
+df = df.sort_index()
+
+# Example: Calculate a rolling mean for battery_soc for each site
+# This is a common technique for anomaly detection (deviation from rolling average)
+# For more advanced feature engineering, consider group-by operations on 'site_id'
+
+# Ensure data is sorted by site_id and then timestamp for correct rolling calculations
+df_sorted = df.sort_values(by=['site_id', 'timestamp'])
+
+# Calculate rolling mean of battery_soc for each site
+df_sorted['battery_soc_rolling_mean_5min'] = df_sorted.groupby('site_id')['battery_soc'].transform(lambda x: x.rolling('5min').mean())
+df_sorted['battery_soc_deviation_5min'] = df_sorted['battery_soc'] - df_sorted['battery_soc_rolling_mean_5min']
+
+print("
+DataFrame with new features head:")
+print(df_sorted.head())
+
+# Further steps would involve more complex feature engineering,
+# model selection, training, evaluation, and deployment using Vertex AI services.
+```
+
+## Phase 9: ML Anomaly Detection - Testing Plan (Completed)
+- **Objective:** Implement, train, evaluate, and test the anomaly detection model using the Vertex AI Workbench environment.
+- **Deliverables:**
+    -   Detailed feature engineering implemented in Vertex AI Workbench notebook.
+    -   Data prepared (scaled, split) for model training.
+    -   Anomaly detection model selected (e.g., Isolation Forest, One-Class SVM, Autoencoder) and trained.
+    -   Model evaluated, and anomaly threshold determined.
+    -   Model tested and refined on unseen data.
+    -   Mechanism to write detected anomalies to `microgrid_db.anomaly_events` BigQuery table.
+
+## Phase 10: Streamlit Dashboard Implementation (In Progress)
+
+### Phase 10: Streamlit Dashboard Implementation
+
+1.  **Dashboard Design & Mockup (Conceptual): (Completed)**
+    *   **Objective:** Define the visual layout, user experience (UX), and interactive components for the Streamlit application.
+    *   **Conceptual Design:**
+        *   **Sidebar:**
+            *   Logo/Title: "Microgrid Operations Dashboard"
+            *   Navigation Links: "Fleet Overview", "Site Details", "Anomaly Monitor", "Notifications", "Settings"
+            *   Anomaly Threshold Slider: A `st.slider` widget for `contamination` parameter (0.0 to 1.0, default 0.05).
+            *   Refresh Interval Selector: Dropdown for data refresh rate.
+        *   **Main Content Area (Default: Fleet Overview):**
+            *   **Fleet Overview Panel:**
+                *   Key Performance Indicators (KPIs): Total Active Sites, Total Active Anomalies.
+                *   Summary Table: `site_id`, Current `battery_soc`, Current `solar_w`, Current `load_w`, Last Anomaly Timestamp, Status (Green/Yellow/Red indicator based on `inverter_state` and active anomalies).
+                *   Interactive Map (Placeholder): If geographic data were available, a map could show site locations and status.
+            *   **Site Details Panel (activated by selecting a site from Fleet Overview):**
+                *   Site-specific KPIs: Current Power Balance, Battery Health.
+                *   Real-time Gauges/Indicators for: `battery_v`, `battery_soc`, `inverter_temp`, `load_w`, `solar_w`.
+                *   Time-series Charts: Interactive plots (e.g., Plotly, Altair) showing `battery_soc` over last 24h/7d.
+                *   Current `inverter_state` and `fault_code` displayed prominently.
+                *   "Recent Anomalies for this Site" Table: Filtered view of `anomaly_events` for the selected `site_id`.
+                *   **Anomaly Monitor Panel:**
+                    *   Table of Active Anomalies: List from `anomaly_events` table, sortable by `timestamp`, `severity`, `site_id`. Columns: `timestamp`, `site_id`, `anomaly_score`, `fault_type`, `severity`, `agent_summary`, `acknowledged`.
+                    *   Anomaly Detail View (on row click): Expand to show full `agent_summary`, related telemetry snapshot, and "Acknowledge" button.
+                *   **Notifications Panel:**
+                    *   Stream of Agent Events: Display `agent_summary` from `microgrid-agent-events`, potentially with `severity` and `timestamp`.
+                    *   "Operator Chat" Input (Future): Placeholder for agent interaction.
+                *   **Settings Panel (Conceptual, for ML model/threshold):**
+                    *   "Save Threshold" button (to persist new `contamination` value to Cloud Run service).
+                    *   (Future) Model Version Selector.
+    *   **Deliverable:** This conceptual design outlining the layout and functionality.
+
+2.  **Streamlit Application Core Development (Local First): (Completed)**
+    *   **Objective:** Develop the foundational Streamlit application logic, UI elements, and data fetching mechanisms in a local development environment.
+    *   **Action:**
+        *   Created `dashboard_app.py` with initial Streamlit layout and BigQuery data fetching.
+        *   Created `requirements.txt` with necessary Python packages.
+    *   **Deliverable:** A functional Streamlit application that can be run locally, demonstrating the UI layout and ability to fetch data from BigQuery and Redis.
+
+## Phase 11: Vertex AI Workbench — BigQuery Connectivity Fix (Completed)
+
+- **Issue:** Jupyter notebook on `microgrid-anomaly-detection-notebook` (Vertex AI Workbench) failed with:
+  `403 request failed: the user does not have 'bigquery.readsessions.create' permission for 'projects/microgrid-demo'`
+- **Root Cause 1:** `bigquerystorage.googleapis.com` (BigQuery Storage API) was not enabled. The `to_dataframe()` call in the BigQuery Python client uses the Storage API by default for fast columnar reads — this is separate from the core `bigquery.googleapis.com` API.
+- **Root Cause 2:** `bigquery.readsessions.create` is NOT included in `roles/bigquery.dataEditor` or `roles/bigquery.dataViewer`. It exists only in `roles/bigquery.admin`, which is too broad to grant.
+- **Fix Applied:**
+    1. Enabled API: `gcloud services enable bigquerystorage.googleapis.com --project=microgrid-demo`
+    2. Created custom IAM role `projects/microgrid-demo/roles/bigquery_storage_reader` with permissions:
+       - `bigquery.readsessions.create`
+       - `bigquery.readsessions.getData`
+       - `bigquery.readsessions.update`
+    3. Bound role to `microgrid-agent@microgrid-demo.iam.gserviceaccount.com`
+- **Outcome:** Successfully fetched 1000 records from `microgrid_db.microgrid_telemetry` into a Pandas DataFrame. All 17 columns confirmed, zero nulls, 10-second cadence data across 11 sites validated. Rolling SOC feature engineering also confirmed working.
+
+## Phase 12: Isolation Forest Model Training & GCS Artefact Storage (Completed)
+
+- **Training data:** 48,629 rows fetched from `microgrid_db.microgrid_telemetry` (12 sites, 2026-03-26 to 2026-03-27). After lag-feature dropna: 23,176 training rows.
+- **Features (16):** 12 raw telemetry fields + 4 derived: `battery_v_norm`, `efficiency_ratio`, `soc_rate_per_min`, `mode_transitions_per_hour`
+- **Model:** `sklearn.IsolationForest` — n_estimators=200, contamination=0.05, random_state=42
+- **Result:** 1,159 anomalies flagged (5.0% — matches contamination parameter as expected)
+- **Artefacts saved to GCS:**
+  - `gs://microgrid-ml-artefacts/models/2026-03-27/isolation_forest.joblib`
+  - `gs://microgrid-ml-artefacts/models/2026-03-27/scaler.joblib`
+  - `gs://microgrid-ml-artefacts/models/2026-03-27/metadata.json`
+- **IAM fixes required:**
+  - Bucket `microgrid-ml-artefacts` created via owner account (SA lacks `storage.buckets.create`)
+  - `roles/storage.objectAdmin` granted to `microgrid-agent` SA at bucket level
+  - Use `storage_client.bucket(BUCKET_NAME)` (local reference) instead of `get_bucket()` to avoid needing `storage.buckets.get`
+- **Notebook:** `notebook_cells.py` in repo root contains all reusable training cells
+
+## Phase 13: Cloud Run Anomaly Detector + Live Pub/Sub Pipeline (Completed)
+
+- **Service:** `anomaly-detector` deployed to Cloud Run (australia-southeast1, 512Mi, 1 vCPU)
+  - URL: `https://anomaly-detector-633335742473.australia-southeast1.run.app`
+  - `POST /score` — direct telemetry JSON, returns score + is_anomaly, writes anomalies to BQ
+  - `POST /pubsub` — handles Pub/Sub push envelope (base64 unwrap), feeds into same scoring logic
+  - `GET /health` — liveness check, confirms model loaded
+- **Source:** `anomaly_detector/` directory (main.py, requirements.txt, Dockerfile)
+- **IAM:** `microgrid-agent` SA granted `roles/run.invoker` on the Cloud Run service
+- **Pub/Sub wiring:** `anomaly-trigger-sub` push endpoint updated from placeholder to `/pubsub`
+- **BigQuery write:** Confirmed anomalies writing live to `microgrid_db.anomaly_events`
+  - Includes rule-based `fault_type` and `severity` (placeholder until Agent 2 in Sprint 3)
+  - `fault_type` classification: overvoltage (>28V), soc_drop (<10%), thermal (>50/60°C), power_balance (solar>3kW), unknown
+  - `severity`: critical (<-0.65), high (<-0.58), medium (≥-0.58)
+- **Note:** `hw-node-01` telemetry skipped at scoring (missing derived fields — expected, hardware schema differs slightly)
+- **Sprint 2 ML pipeline complete:** telemetry → Pub/Sub → Cloud Run score → anomaly_events BQ
+
+## Phase 14: Streamlit Dashboard — Professional Rebuild (Completed)
+
+- **Full rewrite** of `dashboard_app.py` (~280 lines). Dropped basic st.line_chart/dataframe in favour of Plotly + custom HTML/CSS.
+- **Design:** White background, blue (#0A6EBD) for KPI indicators, green/amber/red severity palette, Inter font, card shadows, badge system.
+- **Pages:**
+  - **Fleet Overview:** 5 KPI cards (sites, solar kW, load kW, avg SOC, alarm count) + HTML site-status table with inline SOC progress bars + grouped Solar vs Load bar chart (all sites)
+  - **Site Details:** SOC gauge (Plotly Indicator), 6 live KPI cards, SOC trend (area, 24h), Solar vs Load overlay, Power Balance diverging bar, anomaly table per site
+  - **Anomaly Monitor:** Severity KPI cards, interactive timeline scatter (coloured by severity), score histogram, anomaly count per site bar chart, filterable events table
+  - **Settings:** ML model info card + infrastructure summary card
+- **Auto-refresh:** configurable 15–300s via sidebar select slider
+- **Added:** `plotly` to requirements.txt
+
+## Phase 15: Triage Agent — LangGraph + Claude Sonnet (In Progress)
+
+### Step 1: anomaly-detector → microgrid-anomalies Pub/Sub (Completed)
+- Added `pubsub_v1.PublisherClient` to `anomaly_detector/main.py`
+- `write_anomaly_to_bq()` now also publishes full telemetry + score to `microgrid-anomalies` topic on every anomaly
+- Redeployed `anomaly-detector` (revision 00003-nrt)
+
+### Step 2: Triage Agent — Cloud Run service (Pending API key)
+- **Source:** `triage_agent/` (main.py, requirements.txt, Dockerfile)
+- **Stack:** FastAPI + LangGraph (3-node graph) + Anthropic SDK + BigQuery + Pub/Sub
+- **LangGraph flow:** `fetch_context` → `classify_fault` → `persist_results` → END
+  - `fetch_context`: queries 30-min BQ window for affected site (min/max/avg of key fields)
+  - `classify_fault`: calls Claude Sonnet with telemetry snapshot + context, returns structured JSON
+  - `persist_results`: DML UPDATE on `anomaly_events`, publishes `triage_complete` to `microgrid-agent-events`
+- **Fault types:** overvoltage, undervoltage, soc_drop, grid_outage, thermal, power_balance, battery_stress, unknown
+- **Secret:** `anthropic-api-key` created in Secret Manager; SA granted `secretmanager.secretAccessor`
+- **Deployed:** revision triage-agent-00002-hk2 — URL: https://triage-agent-633335742473.australia-southeast1.run.app
+- **Pub/Sub:** `triage-trigger-sub` created on `microgrid-anomalies` → push to `/pubsub`
+- **Fixes applied:** (a) JSON markdown fence stripping for Claude response; (b) INSERT instead of DML UPDATE to avoid BQ streaming buffer lock
+- **Confirmed working:** Claude classifying live anomalies as `battery_stress/medium` with NL summaries in `anomaly_events`
+- **Note:** `battery_stress` is the dominant fault type — simulator batteries charge to 100% during peak solar then continue showing discharge current, which the model flags as anomalous. Realistic and accurate classification by Claude.
+
+### Step 3: Dashboard pulse indicator (Coded, pending triage agent deploy)
+- CSS pulse animation added to sidebar (green strobe when active, grey when idle)
+- `fetch_agent_activity()` queries `anomaly_events` for `[AI Triage]` prefixed summaries in last 5 min
+- Shows site, timestamp, fault_type, severity, and truncated summary in sidebar panel
+- **Status:** Complete — pulse indicator live once dashboard restarts
+
+## Phase 16: System Architecture Diagram (Completed)
+
+- Generated `system_diagram.png` (24×14in, 180dpi) via `draw_diagram.py` (matplotlib)
+- Six-tier layout: Edge → GCP VM/Ingest → Pub/Sub → Storage/ML → AI Agent Layer → Presentation
+- All data flows annotated with protocol/subscription labels
+- Colour-coded to match dashboard palette; legend and sprint status footer included
+
+## Phase 17: API Cost Controls (Completed)
+
+- **Issue:** Claude Sonnet triage calls accumulating rapidly — ~$1+ within minutes due to continuous anomaly stream from 11 simulator sites
+- **Fix 1 — Model downgrade:** Triage agent switched from `claude-sonnet-4-6` to `claude-haiku-4-5-20251001`
+  - ~12× cheaper per call; structured JSON fault classification well within Haiku capability
+  - Sonnet reserved for Sprint 3 Operator Chat (user-facing, quality-critical)
+- **Fix 2 — Per-site cooldown:** In-process `_last_triaged` dict suppresses re-triage of the same site within 10 minutes
+  - Worst-case call rate drops from ~continuous to ≤1.1 calls/minute across all 11 sites
+- **Redeployed:** triage-agent revision 00003-zxj
+
+### Cost Control Update — Cooldown Extended to 15 Minutes (2026-03-28)
+- `COOLDOWN` updated to `timedelta(minutes=120)` in `triage_agent/main.py` — 2-hour window for idle/cost-controlled running
+- Reduces Haiku call rate to ≤0.09/min (≤5.5/hr) across 11 sites
+- **For demo:** set back to `timedelta(minutes=5)` → ≤2.2/min for snappy live response
+- Redeployed: triage-agent (redeploy required after each cooldown change)
+
+## Phase 18: Dispatch Agent — Slack Alerts (Completed)
+
+- **Service:** `dispatch-agent` deployed to Cloud Run (australia-southeast1, 512Mi, 1 vCPU)
+  - URL: `https://dispatch-agent-633335742473.australia-southeast1.run.app`
+  - `POST /pubsub` — handles Pub/Sub push from `microgrid-agent-events`; filters `triage_complete` events
+  - `GET /health` — liveness check; reports `slack_configured` status
+- **Source:** `dispatch_agent/` (main.py, requirements.txt, Dockerfile)
+- **Stack:** FastAPI + LangGraph (2-node: `route` → `send_slack`) + Slack Block Kit
+- **LangGraph flow:**
+  - `route`: extracts severity/site/fault, builds rich Slack Block Kit payload (header, fields, AI summary, root cause, recommended action, critical ACK prompt)
+  - `send_slack`: dispatches to Slack webhook; only sends for severity ∈ {critical, high, medium} — suppresses low to reduce noise
+- **Slack formatting:** severity-coded colour bars (#E74C3C critical, #E67E22 high, #F1C40F medium, #27AE60 low) + emoji indicators (🔴🟠🟡🟢)
+- **Secret:** `slack-webhook-url` created in Secret Manager; SA granted `secretmanager.secretAccessor`; mounted as `SLACK_WEBHOOK_URL` env var via `--set-secrets`
+- **Pub/Sub:** `dispatch-sub` created on `microgrid-agent-events` → push to `/pubsub`; SA granted `run.invoker`
+- **End-to-end confirmed:** Test `triage_complete` event → dispatch agent → Slack `{"slack_sent": true}` ✓
+- **Pipeline complete:** telemetry → anomaly-detector → triage-agent (Claude Haiku) → dispatch-agent → Slack
+
+## Phase 19: Operator Chat Agent — LangGraph + Claude Sonnet (Completed)
+
+- **Service:** `chat-agent` deployed to Cloud Run (australia-southeast1, 512Mi, 1 vCPU, --allow-unauthenticated)
+  - URL: `https://chat-agent-633335742473.australia-southeast1.run.app`
+  - `POST /chat` — accepts `{"messages": [...], "session_id": ""}`, returns `{"response": "...", "tools_used": [...]}`
+  - `GET /health` — liveness check; reports model in use
+- **Source:** `chat_agent/` (main.py, requirements.txt, Dockerfile)
+- **Stack:** FastAPI + LangGraph (ReAct loop: `agent` ↔ `tools` → END) + Anthropic SDK (Claude Sonnet 4.6)
+- **LangGraph flow:** agent node calls Claude with tools; if tool_use → tools node executes + loops back; if end_turn → returns response. Max 12 iterations.
+- **Tools (4):**
+  - `get_site_status(site_id)` — latest telemetry row (battery, solar, load, temps, inverter state)
+  - `get_fleet_overview()` — latest row per active site across fleet
+  - `get_recent_anomalies(site_id?, limit?)` — AI-triaged anomaly events from BQ
+  - `get_telemetry_trend(site_id, hours?)` — statistical summary over time window
+- **Security:** site_id validated with regex `^[a-z0-9\-]{1,32}$` before BQ use (prevents injection)
+- **Dashboard integration:**
+  - "Operator Chat" added as 5th navigation page
+  - `st.chat_message` UI with ⚡ avatar for assistant, tool usage footer per message
+  - 6 clickable sample questions for demo quick-start
+  - Session history maintained in `st.session_state.chat_msgs`
+  - Auto-refresh disabled on chat page (prevents conversation interruption)
+  - `CHAT_AGENT_URL` env var configurable (defaults to deployed URL)
+- **Confirmed working:** Live query "Which sites have the lowest battery SOC?" returned formatted table with live BQ data ✓
+- **Agent count: 4 deployed** — anomaly-detector, triage-agent, dispatch-agent, chat-agent
+
+## Phase 20: Human-in-the-Loop ACK Gate (Completed)
+
+- **Problem:** BQ DML UPDATE blocked on streaming buffer — same root cause as triage-agent Phase 15
+- **Solution:** New `ack_events` table (site_id, anomaly_timestamp, fault_type, severity, acked_at); ACK recorded via streaming insert; `fetch_pending_acks` uses LEFT JOIN to exclude acknowledged rows
+- **dispatch-agent `/ack` endpoint (new):**
+  - `POST /ack` — accepts `{site_id, timestamp, fault_type, severity, agent_summary}`
+  - Streams ACK row into `microgrid_db.ack_events`
+  - Posts green Slack Block Kit "✅ ACKNOWLEDGED" card with fault details + timestamp
+  - Redeployed as `--allow-unauthenticated` (revision 00004-tq8) for dashboard access
+- **Dashboard ACK banner (all pages):**
+  - `fetch_pending_acks()` — LEFT JOINs `anomaly_events` + `ack_events`, returns unacked critical/high AI triage events (ttl=20s)
+  - Blinking red dot + red banner shown when ≥1 unacked critical/high alert exists
+  - Per-alert row: severity badge, fault type, site, timestamp, truncated AI summary
+  - "✓ ACK" primary button → POST `/ack` → `st.cache_data.clear()` → `st.rerun()`
+- **End-to-end confirmed:** `/ack` returns `{"status":"acknowledged"}`, Slack green card delivered ✓
+- **Full HITL loop:** anomaly → Haiku triage → Slack alert (orange/red) → operator sees dashboard banner → clicks ACK → BQ recorded + Slack green confirmation

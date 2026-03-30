@@ -1,0 +1,268 @@
+Microgrid IIoT + Agentic AI Platform
+GCP Architecture Redesign & Developer Work Plan
+
+ProjectMicrogrid Telemetry, Anomaly Detection & Multi-Agent OperationsBrandstinylab.ai  (AI/integration layer)  �  Amplified Engineering (hardware/gateway)Versionv1.0  �  Work PlanDateMarch 2026StatusDRAFT � For developer team reviewAuthorCo-founders, Amplified Engineering / tinylab.ai
+This document defines the agreed module decisions, GCP infrastructure redesign, and sprint-by-sprint development tasks to evolve the current single-site Victron telemetry POC into a production-ready multi-site microgrid monitoring platform with classical ML anomaly detection and a LangGraph multi-agent AI layer.
+
+
+1. Current State Audit
+1.1 What is Working (POC)
+The following components are operational and have been validated end-to-end against a physical Victron MultiPlus inverter via the nodeMINI gateway.
+
+ComponentImplementationStatusEdge gateway (nodeMINI)Reads Victron Modbus registers via SQLite3 dataout.db, publishes JSON to MQTT (port 1883, unsecured)WORKINGGCP VM (victron-broker)e2-micro, australia-southeast1-a, Debian 11, Mosquitto brokerWORKINGVM bridge scriptmqtt_to_pubsub.py: subscribes MQTT, flattens JSON (timeStamp?timestamp), publishes to Pub/SubWORKINGGCP Pub/SubTopic: victron-telemetry, BigQuery push subscription: victron-bq-subWORKINGBigQueryDataset: microgrid_victron_db, Table: inverter_data (key, value, timestamp, data:STRING catch-all)WORKINGBigQuery viewclean_inverter_telemetry: COALESCE key/value/timestamp from raw + data columnWORKINGLooker StudioLive dashboard on clean_inverter_telemetry view, 1-min refreshWORKING (to replace)VM simulatorsim_pub_local.py: 5 parameters, 10s interval, publishes directly to MosquittoWORKING (to extend)
+1.2 Current Telemetry Schema (5 Parameters)
+The existing schema uses a narrow key-value-timestamp model with a catch-all data:STRING fallback. This must be extended for anomaly detection.
+
+Parameter keyRegisterScaleRange (12V sys)Anomaly signalBattery_Voltage26/100 ? V12.8 � 14.2 VOver/under voltageAC_In_Voltage3/10 ? V230 � 245 VGrid outage detectionLoad_Current18/10 ? A0.5 � 12 ALoad spikeLoad_Voltage15/10 ? V228 � 232 VOutput regulation failureInverter_Status31enum3/8/9Mode transition anomaly
+1.3 Known Gaps / Limitations
+� MQTT unsecured (port 1883, allow_anonymous true) � not acceptable beyond POC
+� Single site only � no site_id partitioning in BigQuery table
+� Simulator runs on GCP VM only, not containerised, not portable
+� Looker Studio 1-minute refresh too slow for live demo
+� No battery current, SOC, temperature � insufficient for ML anomaly detection
+� No agentic AI layer � notifications are rule-based only
+� No human-in-the-loop approval gate
+� Bridge script (mqtt_to_pubsub.py) not a systemd service � dies on SSH disconnect
+
+
+2. Module Decision Register
+Each module has been evaluated against four options. Final decisions are recorded below. Status key: BUILT = keep as-is, EXTEND = modify existing, NEW = build from scratch, AGENT = agentic AI component.
+
+BUILT  � Keep existingEXTEND � Modify existingNEW    � Build from scratchAGENT  � Agentic AI layer
+ModuleDecisionRationaleStatusSprintGCP ProjectRename project microgrid-demo, add labels for env/teamClean separation from POCEXTENDS1VM sizeUpgrade e2-micro ? e2-small (2 vCPU, 2GB RAM)Needed for multi-process: Mosquitto + bridge + Redis + agent workerEXTENDS1MQTT securityEnable TLS (port 8883) + username/password auth per deviceRequired before any external site connectsEXTENDS1MQTT topicsRestructure: microgrid/{site_id}/telemetryEnables multi-site partitioning from day 1EXTENDS1Edge simulatorReplace VM script with Docker Compose (11 containers) from sim_site.pyPortable, time-acceleratable, fault-injectableNEWS1Telemetry schemaExtend to 13 fields: add battery_current, battery_soc, battery_temp, ac_input_power, ac_output_power, inverter_temp, solar_w, load_w, power_balance_wRequired for Isolation Forest feature setEXTENDS1BigQuery schemaNew table: microgrid_telemetry with site_id + all 13 fields + derived featuresReplaces key-value model with columnar schema for MLNEWS1BigQuery viewReplace clean_inverter_telemetry with fleet_telemetry_clean + per-site viewsSupports both fleet and single-site queriesEXTENDS1Pub/Sub topicsAdd microgrid-telemetry (raw), microgrid-anomalies (ML output), microgrid-agent-events (agent actions)Three-topic architecture for clean separationEXTENDS2Bridge scriptRewrite mqtt_to_pubsub.py: multi-topic, schema-validated, run as systemd serviceCurrent script dies on SSH disconnectEXTENDS1Redis / MemstoreDeploy Redis OSS on VM (or GCP Memorystore if budget allows)Live fleet state cache for agent toolsNEWS2ML anomaly layerIsolation Forest on 13-feature vector, retrain daily, serve via Cloud Run endpointAuditable classical ML � stronger safety narrative than neural netNEWS2ML training pipelineBigQuery ? Vertex AI Workbench notebook ? sklearn IsolationForest ? joblib artifact ? GCSReproducible, versioned model artefactsNEWS2DashboardReplace Looker Studio with Streamlit app on VM (or Cloud Run)Sub-second refresh, operator chat panel, anomaly feed, notification configNEWS2Operator chat agentLangGraph node, Claude Sonnet via Anthropic API, BigQuery MCP + Redis MCP + Weather API toolsMost visible demo moment � build firstAGENTS3Anomaly triage agentLangGraph node, triggered by IsolationForest score > threshold, classifies fault type + root causeLLM reasoning on top of classical ML � key differentiatorAGENTS3Dispatch agentLangGraph node, drafts NL incident summary, routes via Slack MCP + Twilio webhookNL alert message is the demo money shotAGENTS3Forecast agentLangGraph node, scheduled hourly, SOC trajectory + Weather API solar forecastAnswers real operator question: will battery last the night?AGENTS4LangGraph orchestratorState machine: event ? route ? agent ? human gate ? action. LangSmith tracing.Safety narrative: every action above severity X requires ACKAGENTS3NotificationsTwilio (WhatsApp + SMS) + Slack webhook + Email via SendGridSlack for dev demo, WhatsApp for field operator realismNEWS2Human-in-the-loopStreamlit approve/override panel, LangGraph interrupt node, Slack ACK buttonCritical actions gated behind explicit operator approvalNEWS3Monitoring (GCP)Cloud Logging + Cloud Monitoring dashboards for VM health, Pub/Sub lag, BQ ingest rateOperational hygiene before conference demoNEWS2Auth / IAMService accounts per component, Workload Identity for Cloud Run, no hardcoded keysSecurity baseline before any live demoEXTENDS1tinylab.ai embedStreamlit app served via Cloud Run with custom domain tinylab.ai/demoPublic-facing demo URL for conferences + websiteNEWS4
+
+3. Target GCP Architecture
+3.1 Infrastructure Overview
+The target architecture spans four logical tiers: Edge, Cloud Ingest, Processing (ML + Agent), and Presentation. All components run in GCP project microgrid-demo in region australia-southeast1.
+
+Compute
+ResourceTypeSizePurposemicrogrid-brokerGCE VMe2-smallMosquitto TLS broker, mqtt_to_pubsub bridge (systemd), Redis cache, Streamlit appanomaly-detectorCloud Run1 vCPU / 512MBIsolation Forest scoring endpoint, triggered by Pub/Sub pushagent-workerCloud Run2 vCPU / 1GBLangGraph orchestrator + 4 agents, triggered by Pub/Sub pushml-trainingVertex AI Workbenchn1-standard-2Notebook for IsolationForest training, scheduled weekly
+Storage
+ResourceTypeSchema / Purposemicrogrid_telemetryBigQuery tablesite_id:STRING, timestamp:TIMESTAMP, battery_v, battery_soc, battery_current, battery_temp, ac_input_v, ac_output_v, ac_output_i, ac_input_power, ac_output_power, solar_w, load_w, inverter_state:INT, inverter_temp, fault_code:INT, power_balance_w � all FLOAT64 unless notedanomaly_eventsBigQuery tablesite_id, timestamp, anomaly_score:FLOAT64, fault_type:STRING, severity:STRING, agent_summary:STRING, acknowledged:BOOLml-artefactsGCS bucketVersioned joblib IsolationForest models + scaler, training metadata JSONfleet-stateRedis on VMHash per site_id: latest telemetry reading. TTL 120s. Used by operator chat agent.
+Messaging (Pub/Sub topics)
+TopicSubscriptionsPurposemicrogrid-telemetrybq-ingest-sub (BQ push), anomaly-trigger-sub (Cloud Run push)Raw telemetry from all sitesmicrogrid-anomaliesagent-trigger-sub (Cloud Run push), dashboard-sub (Streamlit pull)Anomaly scores + events from ML layermicrogrid-agent-eventsdashboard-events-sub, notification-subAgent actions, NL summaries, dispatch confirmations
+3.2 GCP CLI Bootstrap (Full Sequence)
+Run the following commands in order from your local machine. Replace PROJECT_ID=microgrid-demo throughout.
+
+Phase 1 � Project and IAM
+gcloud config set project microgrid-demo
+gcloud services enable compute.googleapis.com pubsub.googleapis.com \
+    bigquery.googleapis.com run.googleapis.com \
+    aiplatform.googleapis.com redis.googleapis.com
+
+# Service account for bridge + agents
+gcloud iam service-accounts create microgrid-agent \
+    --display-name='Microgrid Agent Worker'
+
+PROJECT_NUMBER=$(gcloud projects describe microgrid-demo --format='value(projectNumber)')
+SA=microgrid-agent@microgrid-demo.iam.gserviceaccount.com
+
+gcloud projects add-iam-policy-binding microgrid-demo \
+    --member="serviceAccount:${SA}" --role=roles/bigquery.dataEditor
+gcloud projects add-iam-policy-binding microgrid-demo \
+    --member="serviceAccount:${SA}" --role=roles/pubsub.publisher
+gcloud projects add-iam-policy-binding microgrid-demo \
+    --member="serviceAccount:${SA}" --role=roles/pubsub.subscriber
+gcloud projects add-iam-policy-binding microgrid-demo \
+    --member="serviceAccount:service-${PROJECT_NUMBER}@gcp-sa-pubsub.iam.gserviceaccount.com" \
+    --role=roles/bigquery.dataEditor
+
+Phase 2 � VM
+gcloud compute instances create microgrid-broker \
+    --zone=australia-southeast1-a \
+    --machine-type=e2-small \
+    --image-family=debian-12 \
+    --image-project=debian-cloud \
+    --tags=mqtt-server,http-server \
+    --service-account=${SA} \
+    --scopes=cloud-platform
+
+# Firewall: MQTT TLS only (8883). Port 1883 closed.
+gcloud compute firewall-rules create allow-mqtt-tls \
+    --allow tcp:8883 --target-tags=mqtt-server
+gcloud compute firewall-rules create allow-streamlit \
+    --allow tcp:8501 --target-tags=http-server
+
+Phase 3 � BigQuery
+bq mk --dataset microgrid-demo:microgrid_db
+
+bq mk --table microgrid-demo:microgrid_db.microgrid_telemetry \
+    site_id:STRING,timestamp:TIMESTAMP,battery_v:FLOAT64,battery_soc:FLOAT64,\
+    battery_current:FLOAT64,battery_temp:FLOAT64,ac_input_v:FLOAT64,\
+    ac_output_v:FLOAT64,ac_output_i:FLOAT64,ac_input_power:FLOAT64,\
+    ac_output_power:FLOAT64,solar_w:FLOAT64,load_w:FLOAT64,\
+    inverter_state:INT64,inverter_temp:FLOAT64,fault_code:INT64,power_balance_w:FLOAT64
+
+bq mk --table microgrid-demo:microgrid_db.anomaly_events \
+    site_id:STRING,timestamp:TIMESTAMP,anomaly_score:FLOAT64,\
+    fault_type:STRING,severity:STRING,agent_summary:STRING,acknowledged:BOOL
+
+Phase 4 � Pub/Sub
+gcloud pubsub topics create microgrid-telemetry
+gcloud pubsub topics create microgrid-anomalies
+gcloud pubsub topics create microgrid-agent-events
+
+# BigQuery push subscription for raw telemetry
+gcloud pubsub subscriptions create bq-ingest-sub \
+    --topic=microgrid-telemetry \
+    --bigquery-table=microgrid-demo:microgrid_db.microgrid_telemetry \
+    --drop-unknown-fields
+
+# Cloud Run push subscriptions (fill in URL after Cloud Run deploy)
+gcloud pubsub subscriptions create anomaly-trigger-sub \
+    --topic=microgrid-telemetry \
+    --push-endpoint=https://anomaly-detector-HASH-ts.a.run.app/score \
+    --push-auth-service-account=${SA}
+
+
+4. VM Script Redesign
+4.1 Mosquitto TLS Configuration
+Replace the current anonymous plaintext broker with TLS + password auth. All edge devices (nodeMINI + simulated gateways) authenticate with per-device credentials.
+
+# On VM: generate self-signed CA + server cert (replace with Let's Encrypt for production)
+openssl req -new -x509 -days 1826 -extensions v3_ca -keyout ca.key -out ca.crt
+openssl genrsa -out server.key 2048
+openssl req -new -key server.key -out server.csr
+openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out server.crt -days 1826
+sudo cp ca.crt server.crt server.key /etc/mosquitto/certs/
+
+# /etc/mosquitto/conf.d/tls.conf
+listener 8883 0.0.0.0
+cafile /etc/mosquitto/certs/ca.crt
+certfile /etc/mosquitto/certs/server.crt
+keyfile /etc/mosquitto/certs/server.key
+require_certificate false
+allow_anonymous false
+password_file /etc/mosquitto/passwd
+
+# Add device credentials
+sudo mosquitto_passwd -c /etc/mosquitto/passwd hw-node-01
+sudo mosquitto_passwd /etc/mosquitto/passwd site-01  # repeat for each sim site
+
+4.2 Bridge Script (mqtt_to_pubsub.py) � Rewrite
+The rewritten bridge handles multi-site topics, validates schema, updates Redis live state, and runs as a systemd service. Key changes from POC version: topic pattern microgrid/+/telemetry, schema validation against expected 13 fields, Redis HSET per site_id, publishes to microgrid-telemetry Pub/Sub.
+
+# Key structural changes vs POC script
+TOPIC_PATTERN = 'microgrid/+/telemetry'          # was: v1/devices/victron/telemetry
+PUBSUB_TOPIC  = 'microgrid-telemetry'            # was: victron-telemetry
+REDIS_HOST    = 'localhost'                       # new: live fleet state cache
+REQUIRED_FIELDS = [                              # new: schema validation
+    'site_id','timestamp','battery_v','battery_soc','battery_current',
+    'battery_temp','ac_input_v','ac_output_v','ac_output_i',
+    'solar_w','load_w','inverter_state','power_balance_w'
+]
+
+def on_message(client, userdata, msg):
+    payload = json.loads(msg.payload)
+    site_id = msg.topic.split('/')[1]            # extract from topic
+    payload['site_id'] = site_id
+    payload['timestamp'] = payload.get('timestamp', datetime.utcnow().isoformat())
+    # Validate schema
+    missing = [f for f in REQUIRED_FIELDS if f not in payload]
+    if missing: log.warning(f'Missing fields {missing} from {site_id}')
+    # Update Redis live state (TTL 120s)
+    redis_client.hset(f'site:{site_id}', mapping=payload)
+    redis_client.expire(f'site:{site_id}', 120)
+    # Publish to Pub/Sub
+    pubsub_client.publish(pubsub_topic_path, json.dumps(payload).encode())
+
+# systemd service: /etc/systemd/system/mqtt-bridge.service
+[Unit]
+Description=MQTT to Pub/Sub Bridge
+After=network.target mosquitto.service
+[Service]
+ExecStart=/usr/bin/python3 /opt/microgrid/mqtt_to_pubsub.py
+Restart=always
+RestartSec=10
+User=microgrid
+[Install]
+WantedBy=multi-user.target
+
+4.3 Simulator Migration
+The existing VM simulator script is replaced by the Docker Compose multi-container simulator (sim_site.py). It can run locally against the GCP VM broker or on the VM itself during testing.
+
+# Run 11 sim sites against GCP VM broker
+BROKER_HOST=<VM_EXTERNAL_IP> BROKER_PORT=8883 docker compose up -d
+
+# Time-accelerated training data generation (1 day per hour)
+TIME_SCALE=24 INTERVAL_S=5 BROKER_HOST=<VM_EXTERNAL_IP> docker compose up -d
+
+# Monitor a specific site
+docker compose logs -f site-06
+
+
+5. ML Anomaly Detection Layer
+5.1 Feature Engineering (BigQuery SQL View)
+A BigQuery view computes the derived features that the Isolation Forest model consumes. These are not stored raw but computed at query time to keep the table schema clean.
+
+CREATE OR REPLACE VIEW microgrid_db.ml_features AS
+SELECT
+    site_id, timestamp,
+    battery_v, battery_soc, battery_current, battery_temp,
+    ac_input_v, ac_output_v, ac_input_power, ac_output_power,
+    solar_w, load_w, inverter_temp, power_balance_w,
+    -- Derived features
+    battery_v / 24.0 AS battery_v_norm,
+    ac_output_power / NULLIF(ac_input_power + solar_w, 0) AS efficiency_ratio,
+    LAG(battery_soc) OVER (PARTITION BY site_id ORDER BY timestamp) AS prev_soc,
+    (battery_soc - LAG(battery_soc) OVER (PARTITION BY site_id ORDER BY timestamp))
+        / TIMESTAMP_DIFF(timestamp,
+          LAG(timestamp) OVER (PARTITION BY site_id ORDER BY timestamp), SECOND)
+        * 60 AS soc_rate_per_min,
+    COUNT(*) OVER (PARTITION BY site_id,
+        TIMESTAMP_TRUNC(timestamp, HOUR)) AS mode_transitions_per_hour
+FROM microgrid_db.microgrid_telemetry
+WHERE timestamp > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)
+
+5.2 Model Training (Vertex AI Workbench)
+ParameterValueAlgorithmsklearn IsolationForestn_estimators200contamination0.05 (configurable via Streamlit slider)Features13 raw + 4 derived = 17 totalTraining window7 days of sim data (accelerated) or rolling 30-day liveRetraining scheduleDaily via Cloud Scheduler ? Vertex AI PipelineArtefact storageGCS bucket: gs://microgrid-ml-artefacts/models/YYYY-MM-DD/ServingCloud Run endpoint: POST /score ? returns {site_id, score, is_anomaly}
+
+6. Multi-Agent Layer (LangGraph)
+6.1 Framework Decision
+LangGraph is selected over CrewAI and raw LangChain for the following reasons specific to this project:
+� Explicit state machine model maps to ISA-101 supervisory control hierarchy and PhD safety supervisor framework
+� LangGraph interrupt() node provides the human-in-the-loop approval gate natively
+� LangSmith tracing gives auditable decision logs � critical for safety narrative at conferences
+� Most recognised at ODSC East and AI Dev World audiences � reduces explanation overhead
+� Claude Sonnet (claude-sonnet-4-20250514) via Anthropic API as LLM backbone � best reasoning quality for industrial context
+
+6.2 Agent Specifications
+
+Agent 1 � Operator Chat Agent
+AttributeSpecificationTriggerUser message in Streamlit operator chat panelLLMClaude Sonnet via Anthropic API, system prompt: industrial microgrid operator assistantTools / MCPBigQuery MCP (fleet + site queries), Redis MCP (live state), Weather API (OpenWeatherMap)Example queries'Why is site-06 critical?'  /  'What is site-10 SOC forecast overnight?'  /  'Summarise all faults last 6h'OutputNL response with inline data values, optionally triggers forecast agentSprint3
+Agent 2 � Anomaly Triage Agent
+AttributeSpecificationTriggerPub/Sub push: anomaly score > configurable threshold (default 0.6)LLMClaude Sonnet, system prompt: anomaly classification for off-grid solar systemsTools / MCPBigQuery MCP (last 30-min window for affected site), Python sandbox (statistical tests), Historical MCP (similar past events)Outputfault_type (enum: overvoltage/soc_drop/grid_outage/thermal/power_balance), severity (critical/high/medium/low), root_cause_hypothesis (NL), recommended_action (NL)Publishes tomicrogrid-anomalies Pub/Sub topic, anomaly_events BigQuery tableSprint3
+Agent 3 � Dispatch + Report Agent
+AttributeSpecificationTriggeranomaly_events event, severity >= mediumLLMClaude Sonnet, drafts operator-facing NL incident summaryTools / MCPSlack MCP (post to #microgrid-alerts), Twilio webhook (WhatsApp + SMS), SendGrid (email digest)Routing rulesSeverity x channel matrix from Notifications panel config (stored in GCS JSON)Human gateLangGraph interrupt() for severity=critical: operator must ACK in Streamlit or Slack before actionSprint3
+Agent 4 � Forecast Agent
+AttributeSpecificationTriggerCloud Scheduler (hourly) or operator chat requestLLMClaude Sonnet, interprets forecast data in operational contextTools / MCPBigQuery MCP (SOC history + discharge rate), Weather API (OpenWeatherMap solar irradiance 24h forecast), Python sandbox (SOC trajectory projection)OutputPer-site SOC projection to midnight, risk flag if projected SOC < 20%, NL summary for operatorSprint4
+
+7. Sprint Work Plan
+Four 2-week sprints targeting ODSC East (Boston, April). Sprint 1 starts immediately. Each sprint has a defined demo-ready checkpoint.
+
+Sprint 1 � Infrastructure Hardening (Weeks 1�2)
+Goal: Multi-site telemetry flowing securely into GCP. All POC gaps closed. Real hardware + 2 sim sites connected.
+
+TaskOwnerEffortDone whenUpgrade VM to e2-small, set service account, enable APIsDevOps2hVM SSH + gcloud confirmConfigure Mosquitto TLS (port 8883), password auth, systemdDevOps4hnodeMINI connects on 8883Rewrite mqtt_to_pubsub.py: multi-topic, Redis HSET, systemd serviceBackend1dService survives rebootNew BigQuery schema: microgrid_telemetry (13 fields + site_id)Backend2hbq show table OKNew Pub/Sub topics + bq-ingest-sub subscriptionDevOps1hData appears in BQExtend telemetry schema on nodeMINI (add 8 new registers)Firmware1d13 fields in MQTT payloadBuild Docker Compose simulator (sim_site.py + 11 containers)Backend1ddocker compose up, 11 sites in BQUpdate BigQuery view: fleet_telemetry_clean + per-site viewsBackend2hSELECT returns 13 colsIAM audit: no hardcoded keys, service accounts per componentDevOps2hgcloud iam audit passSprint 1 demo checkpoint: 12 sites in BQ, nodeMINI live, TLSAll�Live data in BigQuery
+Sprint 2 � ML Layer + Dashboard (Weeks 3�4)
+Goal: Anomaly detection running live. Streamlit dashboard replacing Looker Studio. Notification channels wired.
+
+TaskOwnerEffortDone whenGenerate training dataset via TIME_SCALE=24 simulator (target: 30d synthetic)Backend4h (runtime)30k+ rows in BQBigQuery ml_features view (derived features: soc_rate, efficiency, transitions)Backend4hSELECT returns 17 colsIsolation Forest training notebook (Vertex AI Workbench)ML1dModel artefact in GCSCloud Run anomaly-detector: POST /score endpoint, loads model from GCSBackend1dcurl /score returns scorePub/Sub anomaly-trigger-sub wired to Cloud Run endpointDevOps2hScore appears in anomaly_events BQanomaly_events BigQuery table + viewBackend2hTable queryableStreamlit dashboard: Fleet overview, Site detail, Anomaly panel, NotificationsFrontend3dAll 4 panels functionalStreamlit: anomaly threshold sliders wired to Cloud Run contamination paramFrontend4hSlider updates scoringTwilio WhatsApp + SMS integration (notification routing)Backend4hTest message receivedSlack webhook integrationBackend2hAlert in #microgrid-alertsCloud Monitoring: VM health, Pub/Sub lag, BQ ingest rate dashboardsDevOps4hAlerts configuredSprint 2 demo checkpoint: live anomaly detection, Streamlit, Slack alertsAll�End-to-end anomaly flow
+Sprint 3 � Agent Layer (Weeks 5�6)
+Goal: LangGraph orchestrator + 3 core agents live. Operator chat functional. Human-in-the-loop gate working.
+
+TaskOwnerEffortDone whenLangGraph orchestrator: state machine, event routing, interrupt() gateAI2dState transitions loggedBigQuery MCP server: query tool for fleet + site dataAI1dAgent returns BQ dataRedis MCP server: live fleet state read toolAI4hAgent reads Redis hashOperator chat agent (Agent 1): wired to Streamlit chat panelAI1dNL query returns dataAnomaly triage agent (Agent 2): classifies fault type + root causeAI1dfault_type in anomaly_eventsDispatch agent (Agent 3): NL summary + Slack/Twilio routingAI1dNL message in SlackHuman-in-the-loop: Streamlit ACK panel + Slack approve buttonAI+Frontend1dCritical alert held pending ACKLangSmith tracing: all agent decisions logged + viewableAI4hTraces visible in LangSmithWeather API tool: OpenWeatherMap solar irradiance integrationBackend4hWeather data in agent contextSprint 3 demo checkpoint: full agent loop, NL chat, NL Slack alert, ACK gateAll�Conference-ready agent demo
+Sprint 4 � Polish + Conference Prep (Weeks 7�8)
+Goal: Demo script rehearsed. tinylab.ai public URL live. Forecast agent deployed. Conference materials ready.
+
+TaskOwnerEffortDone whenForecast agent (Agent 4): SOC trajectory + Weather API + NL summaryAI1dOvernight SOC projection worksCloud Run deployment: Streamlit app on custom domain tinylab.ai/demoDevOps1dPublic URL accessible10-minute demo script: narrative arc, fault injection trigger, agent responseAll1dRehearsed 3xArchitecture diagram (conference version): one-pager for booth/talkDesign4hPDF exportedtinylab.ai website integration: embed demo widget + case study write-upFrontend1dLive on siteamplified.com.au technical guide: nodeMINI ? GCP ? agentic AI pipelineBackend1dPublishedLinkedIn technical post series (5 posts, 1/week from Sprint 2)Co-foundersOngoing5 posts publishedConference pre-outreach: 15 targets at ODSC East identified + messagedCo-founders4hOutreach sentPost-ODSC write-up published within 48h of returnCo-founders3hPublished
+
+8. Risk Register
+
+RiskLikelihoodImpactMitigationnodeMINI 4G dropout during conference demoMediumHighPre-populate 48h of sim data in BQ. Demo can run entirely on simulated sites if hardware offline.Anthropic API rate limit during live demoLowHighCache last 5 agent responses per site. Graceful fallback to rule-based alert if API unavailable.LangGraph orchestrator latency > 10s for anomaly triageMediumMediumAsync trigger: anomaly score fires immediately, agent enrichment follows within 30s. Dashboard shows score before NL summary.BigQuery query cost overrun (accelerated sim data)LowLowPartition table by DATE(timestamp). Set BQ cost controls. Time-accelerated sim runs max 48h.TLS cert expiry on Mosquitto before conferenceLowHighUse 5-year self-signed cert. Add expiry monitoring to Cloud Monitoring.PhD time pressure compresses Sprint 3-4MediumMediumOperator chat agent (Agent 1) is minimum viable agent demo. Agents 2-4 are additive. Sprint 3 can ship with Agent 1 only if needed.
+
+Document ends. Next action: review Module Decision Register (Section 2) with developer team and confirm sprint assignments.
+tinylab.ai  |  Amplified Engineering  �  Microgrid IIoT + Agentic AI Platform
+
+CONFIDENTIAL  �  Internal Development Work Plan  �  v1.0  1 / 2
+

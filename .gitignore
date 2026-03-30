@@ -1,0 +1,34 @@
+# ── Secrets / Keys / Certs (NEVER commit these) ───────────────────────────────
+ca.crt
+*.key
+*.pem
+id_microgrid_demo
+id_microgrid_demo.pub
+.env
+**/.env
+
+# ── Large generated / data files ──────────────────────────────────────────────
+historical_data.csv
+system_diagram.png
+Comprehensive_System_Diagram_G3.png
+*.pdf
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+
+# ── Claude Code local settings ────────────────────────────────────────────────
+.claude/settings.local.json
+
+# ── Misc ──────────────────────────────────────────────────────────────────────
+Restart
+*.log

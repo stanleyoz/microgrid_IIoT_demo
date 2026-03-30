@@ -1,0 +1,297 @@
+● For the triage task specifically — structured JSON classification with fixed fault categories, no tool calling, short outputs — this is
+  actually one of the easier jobs for local models. The complexity bar isn't high.
+
+  Best fits for your RTX 4090 (24GB VRAM):
+
+  ┌──────────────────┬───────┬───────────┬──────────────────┬─────────────────────────────────────────────────────────────────┐
+  │      Model       │ VRAM  │   Speed   │ JSON reliability │                              Notes                              │
+  ├──────────────────┼───────┼───────────┼──────────────────┼─────────────────────────────────────────────────────────────────┤
+  │ Qwen2.5:7B       │ ~8GB  │ Very fast │ Excellent        │ Best structured-output 7B; natively trained on JSON schemas     │
+  ├──────────────────┼───────┼───────────┼──────────────────┼─────────────────────────────────────────────────────────────────┤
+  │ Llama 3.1:8B     │ ~9GB  │ Fast      │ Good             │ Meta's instruction-tuned model, solid reasoning                 │
+  ├──────────────────┼───────┼───────────┼──────────────────┼─────────────────────────────────────────────────────────────────┤
+  │ Gemma 2:9B       │ ~10GB │ Fast      │ Very good        │ Google; better than its size suggests for instruction following │
+  ├──────────────────┼───────┼───────────┼──────────────────┼─────────────────────────────────────────────────────────────────┤
+  │ Mistral Nemo 12B │ ~13GB │ Good      │ Good             │ Larger headroom for technical reasoning                         │
+  ├──────────────────┼───────┼───────────┼──────────────────┼─────────────────────────────────────────────────────────────────┤
+  │ Qwen2.5:14B      │ ~16GB │ Good      │ Excellent        │ Worth it if JSON reliability matters more than speed            │
+  └──────────────────┴───────┴───────────┴──────────────────┴─────────────────────────────────────────────────────────────────┘
+
+  My recommendation for triage: qwen2.5:7b
+
+  The reasons it fits your use case particularly well:
+  - Alibaba specifically trained Qwen2.5 on structured data extraction and JSON output — it's unusually good at schema adherence for a 7B
+  - Your system prompt is already well-engineered (fixed enum values, explicit "respond ONLY with valid JSON")
+  - The fault classification task is bounded — 8 fault types × 4 severity levels — not open-ended reasoning
+  - Leaves 16GB headroom on the 4090 for other processes
+
+  Honest caveats vs Haiku:
+  - JSON fence stripping code you already have in classify_fault will still get exercised — local models are less consistent about not
+  adding markdown
+  - Edge cases (unusual telemetry combos) may get classified as unknown more often
+  - Response time will be faster locally once the model is loaded, but cold start is slower
+
+
+CONNECTIVITY DISCUSSION
+
+  The Call Path
+
+  Cloud Run (triage-agent, GCP australia-southeast1)
+      → your fiber public IP:11434
+      → router port-forward
+      → ae4090 (Ollama)
+
+  What You Need to Configure
+
+  On ae4090 — Ollama must bind to all interfaces (it defaults to localhost-only):
+  # Add to /etc/systemd/system/ollama.service  [Service] section:
+  Environment="OLLAMA_HOST=0.0.0.0"
+
+  # Then:
+  sudo systemctl daemon-reload && sudo systemctl restart ollama
+
+  On your fiber router — port-forward TCP 11434 → ae4090's LAN IP.
+
+  In model_config.json — point ollama_base_url at your public IP:
+  "ollama_base_url": "http://YOUR.PUBLIC.IP:11434/v1"
+
+  ---
+  Security Risk — This Is the Big One
+
+  Ollama has no authentication by default. Port 11434 exposed to the internet means anyone who finds it can use your GPU for free. Minimum
+  mitigations:
+
+  Option A — IP whitelist at the router (easiest)
+  Cloud Run doesn't have fixed outbound IPs by default, so this needs Cloud NAT with a reserved static IP. Then you whitelist only that IP
+  at the router firewall.
+
+  Option B — Tailscale (cleanest, recommended)
+  - Install Tailscale on ae4090
+  - Add Tailscale as a https://tailscale.com/kb/1458/run-cloudrun
+  - No port forwarding needed, traffic is encrypted + authenticated
+  - ollama_base_url points to ae4090's Tailscale IP
+
+  Option C — Cloudflare Tunnel (zero port-forward needed)
+  - Run cloudflared tunnel on ae4090
+  - Gives you a stable https://xxx.trycloudflare.com URL
+  - No open ports, free tier
+
+  ---
+  Other Practical Issues
+
+  ┌─────────────────┬───────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │      Issue      │                                                      Detail                                                       │
+  ├─────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Dynamic IP      │ If your fiber IP changes, the URL breaks — need a DDNS service or static IP from your ISP                         │
+  ├─────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Upload          │ LLM responses travel out on your upload link — check it's not the bottleneck (model outputs ~200-300 tokens =     │
+  │ bandwidth       │ small)                                                                                                            │
+  ├─────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Availability    │ If ae4090 sleeps, reboots, or Ollama crashes, triage-agent calls fail — need a graceful fallback to Anthropic     │
+  └─────────────────┴───────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+  ---
+  Recommended Approach for Your Use Case
+
+  Since this is internal testing, the pragmatic path is:
+
+  1. Tailscale — 30 min setup, most secure, no dynamic IP problem
+  2. Add a fallback in llm_client.py so if Ollama returns an error, it retries with Anthropic Haiku — keeps the pipeline running during dev
+
+SCALING OUT DISCUSSION
+
+● Anomaly Detector — Cloud Run Scaling Model
+
+  First, a quick reminder of which service does what:
+
+  Telemetry (MQTT)
+      → Pub/Sub microgrid-telemetry
+          → anomaly-detector (Cloud Run) ← Isolation Forest scoring, CPU-bound
+              → Pub/Sub microgrid-anomalies
+                  → triage-agent (Cloud Run) ← LLM call (Haiku or Ollama)
+                      → Pub/Sub microgrid-agent-events
+                          → dispatch-agent (Cloud Run) ← Slack
+
+  ---
+  How Cloud Run Scales for Pub/Sub Push
+
+  Each Pub/Sub message becomes an HTTP POST to the Cloud Run endpoint. Cloud Run auto-scales instances based on concurrent in-flight
+  requests. Key parameters:
+
+  ┌─────────────────┬─────────┬──────────────────────────────────────────────────┐
+  │    Parameter    │ Default │                 What it controls                 │
+  ├─────────────────┼─────────┼──────────────────────────────────────────────────┤
+  │ --concurrency   │ 80      │ Requests handled simultaneously per instance     │
+  ├─────────────────┼─────────┼──────────────────────────────────────────────────┤
+  │ --min-instances │ 0       │ Instances kept warm (scale-to-zero vs always-on) │
+  ├─────────────────┼─────────┼──────────────────────────────────────────────────┤
+  │ --max-instances │ 1000    │ Hard cap                                         │
+  ├─────────────────┼─────────┼──────────────────────────────────────────────────┤
+  │ --cpu           │ 1       │ vCPU per instance                                │
+  ├─────────────────┼─────────┼──────────────────────────────────────────────────┤
+  │ --memory        │ 512Mi   │ RAM per instance                                 │
+  └─────────────────┴─────────┴──────────────────────────────────────────────────┘
+
+  Your Isolation Forest model and scaler load once per container startup (module-level), not per request — so warm instances are fast.
+
+  ---
+  Scaling Tiers — Anomaly Detector
+
+  10 → 100 sites (1 → 10 msg/s)
+
+  Current config handles this with zero changes. One instance processes 10 msg/s easily — Isolation Forest scoring takes ~2–5ms per reading.
+   Cloud Run auto-scales if needed but will likely stay at 1–2 instances.
+
+  Recommended change: --min-instances=1 to eliminate cold-start lag on first morning message.
+
+  100 → 1,000 sites (10 → 100 msg/s)
+
+  Auto-scaling kicks in meaningfully. At 100 msg/s with concurrency=80, Cloud Run maintains roughly 2–4 warm instances. The Isolation Forest
+   model (~few MB) is loaded independently in each instance.
+
+  Required changes:
+  # Keep 2 warm instances to handle burst without queuing
+  --min-instances=2
+
+  # Model load time is ~1-2s, so cold starts at this rate hurt without min-instances
+
+  BigQuery streaming inserts become the real bottleneck here — each anomaly write is a separate API call. Batching becomes worthwhile.
+
+  1,000 → 10,000 sites (100 → 1,000 msg/s)
+
+  Cloud Run can handle this, but the architecture starts creaking elsewhere:
+
+  ┌──────────────────────────────────────┬────────────────────────────────────┬─────────────────────────────────────────────────┐
+  │              Bottleneck              │              Problem               │                       Fix                       │
+  ├──────────────────────────────────────┼────────────────────────────────────┼─────────────────────────────────────────────────┤
+  │ Isolation Forest per-message scoring │ 1,000 msg/s = ~6 vCPU continuously │ Batch 10 readings, score together               │
+  ├──────────────────────────────────────┼────────────────────────────────────┼─────────────────────────────────────────────────┤
+  │ BQ streaming inserts                 │ One API call per anomaly           │ Switch to BQ Storage Write API                  │
+  ├──────────────────────────────────────┼────────────────────────────────────┼─────────────────────────────────────────────────┤
+  │ Pub/Sub push delivery                │ One HTTP POST per message          │ Switch to pull subscription with batch consumer │
+  └──────────────────────────────────────┴────────────────────────────────────┴─────────────────────────────────────────────────┘
+
+  At this point Cloud Run is still the right platform but the anomaly-detector needs architectural changes, not just config tweaks.
+
+  ---
+  Triage Agent — Scaling with Ollama on ae4090
+
+  The triage agent has a fundamentally different scaling profile because the cooldown gate decouples it from raw message volume:
+
+  ┌───────┬────────────────┬──────────────────────────────────┬─────────────────────────────────┐
+  │ Sites │ Msg/s ingested │ Triage calls at 120-min cooldown │ Triage calls at 15-min cooldown │
+  ├───────┼────────────────┼──────────────────────────────────┼─────────────────────────────────┤
+  │ 10    │ 1              │ 0.08/min                         │ 0.67/min                        │
+  ├───────┼────────────────┼──────────────────────────────────┼─────────────────────────────────┤
+  │ 100   │ 10             │ 0.8/min                          │ 6.7/min                         │
+  ├───────┼────────────────┼──────────────────────────────────┼─────────────────────────────────┤
+  │ 1,000 │ 100            │ 8.3/min                          │ 67/min                          │
+  └───────┴────────────────┴──────────────────────────────────┴─────────────────────────────────┘
+
+  RTX 4090 throughput for qwen2.5:7b:
+  - Input: ~600 tokens (system prompt + telemetry + BQ context)
+  - Output: ~150 tokens (JSON response)
+  - Speed: ~80–100 tok/s on 4090
+  - Wall-clock per call: ~2–4 seconds
+
+  At 1,000 sites / 120-min cooldown: one triage call every ~7 seconds. The 4090 handles each in 2–4s — comfortable headroom, no queue
+  buildup.
+
+  At 1,000 sites / 15-min cooldown: one call every ~0.9 seconds. Calls start queuing on the GPU — Ollama serialises inference, so queue
+  depth grows. This is where Anthropic Haiku wins on throughput (parallel API calls vs serialised GPU inference).
+
+  ---
+  Tailscale + Cloud Run Architecture
+
+  Cloud Run instance (triage-agent)
+    ├── uvicorn / FastAPI (port 8080)
+    └── tailscaled (userspace-networking, port 1055 SOCKS5)
+          ↓ WireGuard tunnel over internet
+  ae4090 (Tailscale node)
+    └── Ollama (localhost:11434, only reachable via Tailscale)
+
+  Why userspace-networking?
+
+  Cloud Run containers don't have /dev/net/tun — you can't create kernel network interfaces. Tailscale's --tun=userspace-networking mode
+  works around this using a Go-based userspace TCP/IP stack. It's slightly slower than kernel mode but perfectly adequate for LLM API calls.
+
+  Container setup
+
+  The triage-agent Dockerfile gets a start.sh entrypoint:
+
+  FROM python:3.11-slim
+  WORKDIR /app
+
+  # Install Tailscale
+  RUN apt-get update && apt-get install -y curl && \
+      curl -fsSL https://tailscale.com/install.sh | sh && \
+      apt-get clean
+
+  COPY requirements.txt .
+  RUN pip install --no-cache-dir -r requirements.txt
+  COPY main.py start.sh .
+  RUN chmod +x start.sh
+
+  ENV PORT=8080
+  CMD ["./start.sh"]
+
+  start.sh:
+  #!/bin/bash
+  # Start Tailscale daemon (userspace — no kernel TUN needed)
+  tailscaled --tun=userspace-networking --socks5-server=localhost:1055 \
+             --state=/tmp/tailscale-state &
+  sleep 3
+
+  # Authenticate with ephemeral key (auto-expires when container stops)
+  tailscale up \
+    --authkey="${TAILSCALE_AUTH_KEY}" \
+    --hostname="triage-cr-$(hostname | tail -c 8)" \
+    --accept-routes \
+    --ephemeral
+
+  echo "Tailscale up. ae4090 reachable at $(tailscale ip --4 ae4090 2>/dev/null || echo 'check admin')"
+
+  # Start the agent
+  exec uvicorn main:app --host 0.0.0.0 --port 8080
+
+  The Tailscale auth key is stored in Secret Manager as tailscale-auth-key (same pattern as your Anthropic and Slack keys). Add to the Cloud
+   Run deploy command:
+  --set-secrets=TAILSCALE_AUTH_KEY=tailscale-auth-key:latest
+
+  On ae4090
+
+  # Install Tailscale (once)
+  curl -fsSL https://tailscale.com/install.sh | sh
+  sudo tailscale up
+
+  # Ollama bound to all interfaces (for Tailscale traffic)
+  # Edit /etc/systemd/system/ollama.service:
+  Environment="OLLAMA_HOST=0.0.0.0:11434"
+
+  sudo systemctl daemon-reload && sudo systemctl restart ollama
+
+  Then in model_config.json, use ae4090's stable Tailscale IP (100.x.x.x) — not the public WAN IP:
+  "ollama_base_url": "http://100.x.x.x:11434/v1"
+
+  Ollama is never exposed to the public internet — it only listens on the Tailscale interface. No port forwarding needed at the router at
+  all.
+
+  ---
+  Scaling Implications of This Architecture
+
+  ┌───────────────────────────┬─────────────────────────┬─────────────────────────────────────┬───────────────────────────────┐
+  │           Scale           │       Triage load       │         ae4090 utilisation          │            Verdict            │
+  ├───────────────────────────┼─────────────────────────┼─────────────────────────────────────┼───────────────────────────────┤
+  │ 10–100 sites              │ < 1 call/min            │ GPU idle 95%+ of the time           │ Excellent — free inference    │
+  ├───────────────────────────┼─────────────────────────┼─────────────────────────────────────┼───────────────────────────────┤
+  │ 100–500 sites             │ 1–4 calls/min           │ Light duty                          │ Fine                          │
+  ├───────────────────────────┼─────────────────────────┼─────────────────────────────────────┼───────────────────────────────┤
+  │ 500–1,000 sites (120-min) │ 4–8 calls/min           │ Moderate, no queuing                │ Workable                      │
+  ├───────────────────────────┼─────────────────────────┼─────────────────────────────────────┼───────────────────────────────┤
+  │ 1,000 sites (15-min demo) │ ~67 calls/min           │ GPU saturated, queue builds         │ Switch back to Haiku for demo │
+  ├───────────────────────────┼─────────────────────────┼─────────────────────────────────────┼───────────────────────────────┤
+  │ 1,000+ sites production   │ > 8 calls/min sustained │ Consider second GPU or cloud GPU VM │ Architecture decision point   │
+  └───────────────────────────┴─────────────────────────┴─────────────────────────────────────┴───────────────────────────────┘
+
+  The natural evolution: use ae4090 Ollama during internal development (zero API cost), switch model_config.json back to Anthropic for any
+  customer demo or production load where throughput matters.

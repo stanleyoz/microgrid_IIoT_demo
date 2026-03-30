@@ -1,0 +1,79 @@
+version: '3.8'
+
+x-sim-base: &sim-base
+  build: .
+  environment:
+    - BROKER_HOST=${BROKER_HOST:-34.87.254.184}
+    - BROKER_PORT=8883
+    - INTERVAL_S=60
+    - TIME_SCALE=1.0
+    - MQTT_PASS=site-pass-secret
+  restart: always
+
+services:
+  site-01:
+    <<: *sim-base
+    environment:
+      - BROKER_HOST=${BROKER_HOST:-34.87.254.184}
+      - SITE_ID=site-01
+      - MQTT_USER=site-01
+  site-02:
+    <<: *sim-base
+    environment:
+      - BROKER_HOST=${BROKER_HOST:-34.87.254.184}
+      - SITE_ID=site-02
+      - MQTT_USER=site-02
+  site-03:
+    <<: *sim-base
+    environment:
+      - BROKER_HOST=${BROKER_HOST:-34.87.254.184}
+      - SITE_ID=site-03
+      - MQTT_USER=site-03
+  site-04:
+    <<: *sim-base
+    environment:
+      - BROKER_HOST=${BROKER_HOST:-34.87.254.184}
+      - SITE_ID=site-04
+      - MQTT_USER=site-04
+  site-05:
+    <<: *sim-base
+    environment:
+      - BROKER_HOST=${BROKER_HOST:-34.87.254.184}
+      - SITE_ID=site-05
+      - MQTT_USER=site-05
+  site-06:
+    <<: *sim-base
+    environment:
+      - BROKER_HOST=${BROKER_HOST:-34.87.254.184}
+      - SITE_ID=site-06
+      - MQTT_USER=site-06
+  site-07:
+    <<: *sim-base
+    environment:
+      - BROKER_HOST=${BROKER_HOST:-34.87.254.184}
+      - SITE_ID=site-07
+      - MQTT_USER=site-07
+  site-08:
+    <<: *sim-base
+    environment:
+      - BROKER_HOST=${BROKER_HOST:-34.87.254.184}
+      - SITE_ID=site-08
+      - MQTT_USER=site-08
+  site-09:
+    <<: *sim-base
+    environment:
+      - BROKER_HOST=${BROKER_HOST:-34.87.254.184}
+      - SITE_ID=site-09
+      - MQTT_USER=site-09
+  site-10:
+    <<: *sim-base
+    environment:
+      - BROKER_HOST=${BROKER_HOST:-34.87.254.184}
+      - SITE_ID=site-10
+      - MQTT_USER=site-10
+  site-11:
+    <<: *sim-base
+    environment:
+      - BROKER_HOST=${BROKER_HOST:-34.87.254.184}
+      - SITE_ID=site-11
+      - MQTT_USER=site-11
