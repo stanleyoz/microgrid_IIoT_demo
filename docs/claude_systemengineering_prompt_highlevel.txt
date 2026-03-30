@@ -1,0 +1,241 @@
+================================================================================
+ PROJECT BRIEF — MICROGRID IIoT + AGENTIC AI PLATFORM
+ For: Claude Code (claude.ai/code)
+ Style: Senior developer handoff — goals, constraints, stack choices, sprint order
+================================================================================
+
+You are the lead developer on this project. Make sensible engineering decisions
+within the constraints below. Build iteratively in sprint order, validate each
+tier before building the next, and flag any ambiguity before writing code.
+
+================================================================================
+1. WHAT WE ARE BUILDING AND WHY
+================================================================================
+
+A multi-site microgrid IIoT monitoring platform with an agentic AI operations
+layer. The immediate goal is a compelling live demo at ODSC East, April 2026.
+
+Target audience for the demo: technical operators and data engineers who manage
+off-grid solar+battery sites. The demo story is:
+
+  "An anomaly is detected at a remote site. The AI automatically triages it,
+   sends an alert to Slack, and the operator acknowledges it from a dashboard
+   after asking the AI chat agent follow-up questions — all without touching
+   raw telemetry data."
+
+The system must work live during the demo with real data flowing. It does not
+need to be production-hardened, but it must be stable and cost-controlled
+during idle development periods.
+
+
+================================================================================
+2. HARDWARE AND DATA SOURCE
+================================================================================
+
+Real hardware: Victron MultiPlus 24V inverter + solar array on an off-grid site
+in Australia, connected to a nodeMINI/nodeG5 edge computer. The edge computer
+runs a SQLite database populated by the Victron Venus OS via Modbus.
+
+Edge gateway (db2mqtt_microgrid.py):
+  - Polls the SQLite DB every 10 seconds
+  - Publishes a normalised JSON telemetry payload to MQTT
+  - Topic pattern: microgrid/{site_id}/telemetry
+  - Hardware site ID: hw-node-01
+
+Telemetry fields (17):
+  site_id, timestamp, battery_v (24V bank), battery_soc (%), battery_current (A),
+  battery_temp (°C), ac_input_v, ac_output_v, ac_output_i, ac_input_power,
+  ac_output_power, solar_w, load_w, inverter_state, inverter_temp (°C),
+  fault_code, power_balance_w (= solar_w − load_w)
+
+Simulator (sim_site.py): single Python process per site, realistic solar curves,
+load profiles, battery dynamics, occasional injected faults. 11 containers via
+Docker Compose (site-01 through site-11). Same JSON schema as hardware.
+Time-accelerated mode available (TIME_SCALE env var) for testing.
+
+
+================================================================================
+3. TECHNOLOGY STACK — DECISIONS ALREADY MADE
+================================================================================
+
+Cloud:        GCP, region australia-southeast1, project microgrid-demo
+Ingest:       Mosquitto MQTT broker on a GCP e2-small VM (port 8883, TLS,
+              per-device password auth). Bridge to Pub/Sub via Python systemd service.
+Storage:      BigQuery (telemetry + anomaly events). Redis on the same VM for
+              live site state cache (TTL per site).
+ML:           Isolation Forest (sklearn) trained in Vertex AI Workbench notebook,
+              served via Cloud Run. Artefacts stored in GCS.
+Agents:       LangGraph + Anthropic Claude (Haiku for structured tasks,
+              Sonnet for conversational). Deployed as Cloud Run services.
+Alerts:       Slack via webhook (Slack Block Kit for rich formatting)
+Dashboard:    Streamlit, runs locally against GCP (ADC credentials)
+CI/CD:        GitHub Actions → Cloud Run deploy on push to main
+IaC:          gcloud CLI (no Terraform needed at this scale)
+Language:     Python 3.11 throughout
+
+
+================================================================================
+4. ARCHITECTURE — 4 TIERS
+================================================================================
+
+Tier 1  Edge
+        Hardware gateway + Docker Compose simulator → MQTT (TLS 8883) → GCP VM
+
+Tier 2  Cloud Ingest
+        Mosquitto broker → mqtt_to_pubsub.py bridge → Pub/Sub topics
+        Redis cache: latest state per site (for chat agent live queries)
+
+Tier 3  Processing
+        Pub/Sub → anomaly-detector Cloud Run (Isolation Forest scoring)
+                → triage-agent Cloud Run (LangGraph + Claude Haiku)
+                → dispatch-agent Cloud Run (LangGraph + Slack)
+        All agents publish/subscribe via Pub/Sub topics.
+        BigQuery as the system of record for telemetry and agent events.
+
+Tier 4  Presentation
+        Streamlit dashboard (local, GCP ADC) + Operator Chat (Cloud Run agent)
+
+Each tier should be validated end-to-end before building the next.
+
+
+================================================================================
+5. AGENT RESPONSIBILITIES
+================================================================================
+
+anomaly-detector:
+  Scores incoming telemetry with Isolation Forest. On anomaly: write to BQ
+  anomaly_events table, publish enriched event to microgrid-anomalies topic.
+  Rule-based fault_type and severity classification (pre-AI triage placeholder).
+
+triage-agent:
+  Triggered by Pub/Sub push from microgrid-anomalies. Fetches 30-min BQ context
+  for the affected site. Calls Claude Haiku to classify fault type, severity,
+  root cause, and recommended action as structured JSON. Persists enriched result
+  to BQ and publishes to microgrid-agent-events.
+  Include per-site cooldown to control API costs — configurable, default 120 min
+  for idle running, 5 min for demo mode.
+
+dispatch-agent:
+  Triggered by Pub/Sub push from microgrid-agent-events. Formats and sends
+  Slack Block Kit alerts (severity-coloured, rich fields). Suppresses low-
+  severity noise. Also exposes a POST /ack endpoint for the dashboard to call
+  when an operator acknowledges an alert — records the ACK and sends a
+  confirmation message to Slack.
+
+chat-agent:
+  Exposes POST /chat for the dashboard. LangGraph ReAct loop with Claude Sonnet
+  and BQ query tools (site status, fleet overview, recent anomalies, trends).
+  Stateless — session history managed by the dashboard caller.
+
+
+================================================================================
+6. DASHBOARD REQUIREMENTS
+================================================================================
+
+5 pages:
+  Fleet Overview    — KPI cards, site status table with SOC bars, solar/load chart
+  Site Details      — SOC gauge, time-series trends, power balance chart, anomaly log
+  Anomaly Monitor   — severity breakdown, timeline, score histogram, events table
+  Operator Chat     — conversational interface to chat-agent, sample questions for demo
+  Settings          — model info, infrastructure summary, threshold controls
+
+Sidebar (persistent across all pages):
+  - Auto-refresh control (disable on chat page to avoid interrupting conversation)
+  - Agent activity pulse indicator
+  - Human-in-the-loop ACK gate: show unacknowledged critical/high alerts one at a
+    time, operator clicks to acknowledge → calls dispatch-agent /ack
+
+Visual style: professional, dark-on-light, colour-coded severity system
+(green/amber/red), Plotly charts, card-based layout.
+
+
+================================================================================
+7. NON-FUNCTIONAL REQUIREMENTS
+================================================================================
+
+Cost:       ~$30/month at 12 sites in non-demo mode. The main cost lever is
+            triage-agent LLM call frequency — the cooldown period controls this.
+            Document cost projections for 100 and 1000 sites.
+
+Stability:  Must run unattended for days without intervention. Cloud Run
+            scale-to-zero is fine except where cold starts affect demo flow.
+
+Security:   All secrets in GCP Secret Manager. No credentials in code or git.
+            TLS for MQTT. Private GitHub repo. Dedicated SA for CI/CD with
+            least-privilege roles.
+
+Observability: Structured logging in all Cloud Run services. Cloud Run
+            built-in metrics sufficient at this scale.
+
+Demo-readiness: The 5-minute demo flow must work first time every time.
+            Provide a cooldown toggle (code comment or config) so demo mode
+            can be switched on without redeployment.
+
+
+================================================================================
+8. REPOSITORY STRUCTURE
+================================================================================
+
+Organise the repository with clear separation of concerns:
+
+  agents/     — one subdirectory per Cloud Run service
+  dashboard/  — Streamlit app
+  edge/       — hardware gateway, simulator, docker-compose
+  ml/         — training notebook, data generation scripts
+  scripts/    — operational scripts (GCP status check, notebook spinup)
+  docs/       — documentation, plans, architecture diagrams
+
+Root: CLAUDE.md, .gitignore, .github/workflows/deploy.yml
+
+.gitignore must exclude: TLS certs, SSH keys, .env files, large data files,
+Python build artefacts, venv, notebook checkpoints.
+
+CI/CD: GitHub Actions workflow that detects which agents/ subdirectory changed
+and only redeploys that Cloud Run service. Manual workflow_dispatch trigger for
+forced redeploys.
+
+
+================================================================================
+9. SPRINT ORDER
+================================================================================
+
+Sprint 1 — Ingest foundation
+  GCP bootstrap (project, IAM, APIs, Pub/Sub, BQ schema) → VM setup (Mosquitto,
+  TLS, Redis, bridge service) → simulator running → hardware gateway connected
+  → end-to-end telemetry confirmed in BigQuery.
+  Done when: hardware telemetry visible in BQ dashboard query.
+
+Sprint 2 — ML + dashboard
+  Isolation Forest training (Vertex AI Workbench, save artefacts to GCS) →
+  anomaly-detector Cloud Run (score + write anomalies) → Pub/Sub pipeline wired →
+  Streamlit dashboard (all pages except chat).
+  Done when: live anomalies appearing in dashboard anomaly monitor.
+  Note: delete Workbench instance after training to avoid ongoing VM cost.
+
+Sprint 3 — Agentic AI layer
+  triage-agent → dispatch-agent → Slack alerts confirmed → chat-agent →
+  Operator Chat page → human-in-the-loop ACK gate → full demo loop confirmed.
+  Done when: anomaly → Slack alert → dashboard ACK → Slack confirmation works live.
+
+Sprint 4 — Demo polish
+  Forecast agent, custom domain (tinylab.ai), demo rehearsal script,
+  LangSmith tracing, performance tuning.
+
+
+================================================================================
+10. DEFINITION OF DONE (per sprint)
+================================================================================
+
+Each sprint is complete when:
+  - All components deploy without errors
+  - The end-to-end data flow for that sprint is validated with live data
+  - Code is committed to GitHub and CI/CD pipeline is green
+  - docs/progress.txt is updated with what was built and any key decisions made
+  - No hardcoded credentials, no uncommitted secrets
+
+The project is demo-ready when a non-technical observer can follow the 5-minute
+demo narrative (Section 1) without the presenter touching a terminal.
+
+================================================================================
+START WITH SPRINT 1 — ask if any constraint above needs clarification first.
+================================================================================
