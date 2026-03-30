@@ -1,0 +1,518 @@
+================================================================================
+ SYSTEM ENGINEERING PROMPT — MICROGRID IIoT + AGENTIC AI PLATFORM
+ Intended audience: Claude Code (claude.ai/code), session zero
+ Purpose: Fully specify the system so Claude can build it end-to-end
+          without ambiguity, back-and-forth, or re-discovery of known gotchas
+================================================================================
+
+You are the lead developer and cloud architect for the project described below.
+Build it fully, in the sprint order specified. At each phase, write production-
+quality code with no placeholders, commit-ready structure, and working
+deployments. Do not ask clarifying questions on anything covered below — use
+the specifications as written.
+
+================================================================================
+SECTION 1 — PROJECT GOAL
+================================================================================
+
+Build a multi-site microgrid IIoT monitoring and agentic AI platform for a
+live conference demo at ODSC East, April 2026. The system must:
+
+  - Ingest real-time telemetry from Victron MultiPlus 24V solar inverter sites
+    (both real hardware and simulated) via MQTT over TLS into GCP
+  - Detect anomalies using an Isolation Forest ML model
+  - Use LangGraph + Anthropic Claude agents to triage faults, alert operators
+    via Slack, and answer operator questions in natural language
+  - Present a professional Streamlit dashboard with fleet overview, per-site
+    drill-down, anomaly monitor, AI operator chat, and human-in-the-loop ACK
+  - Be cost-controlled: ~$30/month at 12 sites in idle/non-demo mode
+
+The demo narrative: "A field operator sees a battery anomaly alert in Slack,
+opens the dashboard, reads the AI triage summary, asks the chat agent follow-up
+questions, and acknowledges the alert — all without touching raw telemetry."
+
+================================================================================
+SECTION 2 — HARDWARE AND EDGE CONTEXT
+================================================================================
+
+Real hardware: Victron MultiPlus 24V inverter + solar array, connected to a
+nodeMINI or nodeG5 edge computer running a SQLite database at
+/amp/var/dataout.db (written by Victron's Venus OS via Modbus).
+
+Edge gateway script (db2mqtt_microgrid.py):
+  - Reads Modbus-mapped registers from the SQLite DB every 10 seconds
+  - Maps to a normalised JSON telemetry payload
+  - Publishes to MQTT topic microgrid/{site_id}/telemetry
+  - Site ID for hardware: hw-node-01
+  - TLS connection to GCP broker: ca.crt (self-signed CA cert)
+  - MQTT credentials: hw-node-01 / node-pass-secret
+
+Simulator (sim_site.py + docker-compose.yml):
+  - Each container simulates one site with realistic solar curves (sunrise/
+    sunset), load profiles (day/night variation), battery charge/discharge
+    dynamics, and occasional injected fault conditions
+  - 11 simulated sites: site-01 through site-11
+  - Credentials: site-XX / site-pass-secret
+  - Docker Compose env vars: BROKER_HOST, BROKER_PORT, MQTT_USER, MQTT_PASS,
+    SITE_ID, TIME_SCALE (1=realtime, 24=1 day per hour for testing)
+  - Publishes same JSON schema as hardware gateway
+
+Telemetry JSON schema (all fields):
+  site_id, timestamp (ISO8601 UTC), battery_v, battery_soc, battery_current,
+  battery_temp, ac_input_v, ac_output_v, ac_output_i, ac_input_power,
+  ac_output_power, solar_w, load_w, inverter_state, inverter_temp, fault_code,
+  power_balance_w (= solar_w - load_w)
+
+Typical value ranges (use for simulator and anomaly thresholds):
+  battery_v:       22–29V  (24V nominal bank, ~27.6V full charge)
+  battery_soc:     0–100%
+  battery_current: -60 to +60A (negative = discharge)
+  battery_temp:    15–45°C normal, flag >50°C
+  inverter_temp:   20–55°C normal, flag >60°C
+  solar_w:         0–3000W (daytime peak)
+  load_w:          100–800W typical
+  ac_input_v:      0V (off-grid) or 230V (grid-tied)
+  inverter_state:  "inverter", "bulk", "absorption", "float", "passthru"
+  fault_code:      0 = no fault
+
+================================================================================
+SECTION 3 — GCP INFRASTRUCTURE
+================================================================================
+
+Project ID:   microgrid-demo
+Region:       australia-southeast1
+Zone:         australia-southeast1-a
+Billing:      already linked
+
+Service account: microgrid-agent@microgrid-demo.iam.gserviceaccount.com
+  IAM roles:
+    roles/bigquery.dataEditor
+    roles/bigquery.dataViewer
+    roles/bigquery.jobUser
+    roles/pubsub.publisher
+    roles/pubsub.subscriber
+    roles/run.invoker
+    roles/storage.objectAdmin         (for GCS ML artefacts)
+    roles/secretmanager.secretAccessor
+    custom: bigquery_storage_reader   (readsessions.create/getData/update)
+
+Compute VM (microgrid-broker, e2-small, australia-southeast1-a):
+  External IP: 34.87.254.184
+  Runs: Mosquitto MQTT broker (port 8883, TLS), Redis (port 6379)
+  Mosquitto config: TLS with self-signed cert, per-device password auth
+  Firewall: allow-mqtt-tls (8883), allow-streamlit (8501)
+  Systemd service: mqtt-bridge (mqtt_to_pubsub.py — bridges MQTT to Pub/Sub,
+    validates schema, maintains Redis TTL cache per site, TTL=120s)
+
+Pub/Sub topics and subscriptions:
+  microgrid-telemetry
+    bq-ingest-sub       → BigQuery push subscription (microgrid_db.microgrid_telemetry)
+    anomaly-trigger-sub → Cloud Run push → anomaly-detector /pubsub
+
+  microgrid-anomalies
+    triage-trigger-sub  → Cloud Run push → triage-agent /pubsub
+
+  microgrid-agent-events
+    dispatch-sub        → Cloud Run push → dispatch-agent /pubsub
+
+BigQuery dataset: microgrid_db
+  Tables:
+    microgrid_telemetry  — full telemetry, 17 columns + timestamp partitioning
+                           (add PARTITION BY DATE(timestamp) CLUSTER BY site_id
+                           before reaching 1000 sites)
+    anomaly_events       — site_id, timestamp, anomaly_score, fault_type,
+                           severity, agent_summary (string), acknowledged (bool)
+    ack_events           — site_id, anomaly_timestamp, fault_type, severity,
+                           acked_at TIMESTAMP
+                           IMPORTANT: never use DML UPDATE on anomaly_events —
+                           BigQuery streaming buffer blocks DML on recently
+                           inserted rows. Use the separate ack_events table +
+                           LEFT JOIN pattern instead.
+
+GCS bucket: microgrid-ml-artefacts
+  gs://microgrid-ml-artefacts/models/YYYY-MM-DD/isolation_forest.joblib
+  gs://microgrid-ml-artefacts/models/YYYY-MM-DD/scaler.joblib
+  gs://microgrid-ml-artefacts/models/YYYY-MM-DD/metadata.json
+  gs://microgrid-ml-artefacts/notebooks/anomaly_detection_poc.ipynb
+
+Secret Manager secrets:
+  anthropic-api-key     → ANTHROPIC_API_KEY for triage-agent and chat-agent
+  slack-webhook-url     → SLACK_WEBHOOK_URL for dispatch-agent
+  (future) tailscale-auth-key
+
+================================================================================
+SECTION 4 — ML MODEL
+================================================================================
+
+Algorithm: sklearn IsolationForest
+  n_estimators=200, contamination=0.05, random_state=42
+
+Training features (16 total):
+  Raw (12): battery_v, battery_soc, battery_current, battery_temp,
+            ac_input_v, ac_output_v, solar_w, load_w, inverter_temp,
+            fault_code, power_balance_w, ac_output_power
+  Derived (4):
+    battery_v_norm        = battery_v / 29.2
+    efficiency_ratio      = ac_output_power / (load_w + 1)
+    soc_rate_per_min      = SOC change per minute (rolling 6-reading lag)
+    mode_transitions_per_hour = inverter_state changes in past hour
+
+Anomaly score output: negative float, more negative = more anomalous
+  Severity thresholds:
+    score < -0.65  → critical
+    score < -0.58  → high
+    else           → medium
+  is_anomaly threshold: score < -0.52
+
+The anomaly-detector Cloud Run service:
+  - Loads model + scaler from GCS at container startup (module-level, not per request)
+  - POST /score  — direct JSON telemetry, returns {score, is_anomaly, site_id}
+  - POST /pubsub — unwraps Pub/Sub push envelope (base64 decode), calls /score logic
+  - On anomaly: writes to anomaly_events BQ table AND publishes full telemetry
+    + score to microgrid-anomalies Pub/Sub topic
+  - Skip scoring for hw-node-01 (hardware schema has missing derived fields)
+
+================================================================================
+SECTION 5 — LANGGRAPH AGENTS
+================================================================================
+
+All agents are FastAPI + LangGraph on Cloud Run, australia-southeast1.
+All use service account microgrid-agent. All deployed --allow-unauthenticated
+except triage-agent and anomaly-detector (Pub/Sub push only, no public access).
+
+--- AGENT 1: triage-agent ---
+URL: https://triage-agent-633335742473.australia-southeast1.run.app
+Model: claude-haiku-4-5-20251001 (cheap, fast, structured JSON output)
+LangGraph flow (3 nodes): fetch_context → classify_fault → persist_results → END
+
+fetch_context:
+  Query BQ for 30-min window stats on the anomaly site:
+  min/max/avg of SOC, voltage, solar, load, temps, power balance, reading count
+
+classify_fault:
+  Call Claude Haiku with system prompt (fault classifier) + telemetry snapshot
+  + 30-min context. Request structured JSON response only:
+  {fault_type, severity, root_cause, agent_summary, recommended_action}
+  Fault types: overvoltage, undervoltage, soc_drop, grid_outage, thermal,
+               power_balance, battery_stress, unknown
+  Severity: critical, high, medium, low
+  Strip markdown fences from response before json.loads()
+
+persist_results:
+  INSERT to anomaly_events (do NOT UPDATE — streaming buffer issue)
+  Publish triage_complete event to microgrid-agent-events
+
+Cost control: per-site in-process cooldown dict (_last_triaged)
+  COOLDOWN = timedelta(minutes=120)  # non-demo
+  # For demo: timedelta(minutes=5)
+  Check before invoking LangGraph — return {"status": "cooldown"} if active
+
+--- AGENT 2: dispatch-agent ---
+URL: https://dispatch-agent-633335742473.australia-southeast1.run.app
+Model: none (routing + Slack only)
+LangGraph flow (2 nodes): route → send_slack → END
+
+route: filter triage_complete events only; suppress severity=low
+send_slack: POST to SLACK_WEBHOOK_URL with Block Kit payload:
+  - Severity-coloured attachment bar (#E74C3C critical, #E67E22 high,
+    #F1C40F medium, #27AE60 low) + emoji (🔴🟠🟡🟢)
+  - Fields: site, fault_type, severity, root_cause, recommended_action
+  - Section: AI summary text
+  - For critical: add ACK prompt text
+
+POST /ack endpoint (also on dispatch-agent, --allow-unauthenticated):
+  AckRequest: {site_id, timestamp, fault_type, severity, agent_summary}
+  - Stream INSERT to ack_events BQ table
+  - POST green "✅ ACKNOWLEDGED" Block Kit card to Slack
+  IMPORTANT: This endpoint is called by the Streamlit dashboard directly.
+  Must have CORS middleware and be allow-unauthenticated.
+
+--- AGENT 3: chat-agent ---
+URL: https://chat-agent-633335742473.australia-southeast1.run.app
+Model: claude-sonnet-4-6
+LangGraph flow: ReAct loop — agent_node ↔ tools_node → END (max 12 iterations)
+
+agent_node:
+  Call Claude Sonnet with system prompt, TOOLS list, and message history
+  if stop_reason == "tool_use": append assistant content to messages, set done=False
+  if stop_reason == "end_turn": extract text, set done=True
+
+tools_node:
+  Iterate content blocks for type=="tool_use"
+  Execute tool, append tool_result to messages as user role
+  Return updated state → loops back to agent_node
+
+4 BQ tools:
+  get_site_status(site_id)          → latest telemetry row
+  get_fleet_overview()              → latest row per active site (15-min window)
+  get_recent_anomalies(site_id?, limit?) → anomaly_events with AI summaries
+  get_telemetry_trend(site_id, hours?) → statistical summary over time window
+
+Security: validate site_id with regex ^[a-z0-9\-]{1,32}$ before any BQ use
+CORS middleware: allow_origins=["*"] — required for Streamlit dashboard calls
+
+POST /chat: {messages: list, session_id: str} → {response: str, tools_used: list}
+
+ANTHROPIC SDK TOOL FORMAT NOTE:
+  Anthropic uses: stop_reason=="tool_use", content blocks with block.type=="tool_use"
+  Access: block.id, block.name, block.input (dict)
+  Tool results go back as: {"role": "user", "content": [{"type": "tool_result",
+    "tool_use_id": block.id, "content": result_string}]}
+  This is different from OpenAI format — do not confuse them.
+
+--- AGENT 4: anomaly-detector ---
+(Already covered in Section 4 — included here for completeness)
+Not a LangGraph agent; pure FastAPI + sklearn scoring service.
+
+================================================================================
+SECTION 6 — STREAMLIT DASHBOARD
+================================================================================
+
+File: dashboard/dashboard_app.py
+Run: streamlit run dashboard/dashboard_app.py
+
+Design system:
+  Background: white
+  Primary blue: #0A6EBD (KPI cards, headers)
+  Green: #27AE60 / #2ECC71 (normal, solar, surplus)
+  Amber: #E67E22 / #F39C12 (warning, medium severity)
+  Red: #E74C3C / #C0392B (critical, deficit)
+  Font: Inter (via CSS injection)
+  Cards: box-shadow, border-radius: 8px
+
+5 navigation pages (sidebar radio):
+  1. Fleet Overview
+  2. Site Details
+  3. Anomaly Monitor
+  4. Operator Chat
+  5. Settings
+
+Page 1 — Fleet Overview:
+  5 KPI cards: active sites, total solar kW, total load kW, avg fleet SOC,
+               active alarms count
+  HTML site-status table with inline SOC progress bars (colour by SOC level)
+  Grouped bar chart: Solar vs Load per site (all sites)
+
+Page 2 — Site Details:
+  Site selector dropdown
+  SOC gauge (Plotly Indicator), 6 live KPI cards
+  SOC trend area chart (24h)
+  Solar vs Load overlay line chart
+  Power Balance diverging area chart:
+    surplus = (solar_w - load_w).clip(lower=0)  → green fill
+    deficit = (solar_w - load_w).clip(upper=0)  → amber fill
+    Use go.Scatter with fill="tozeroy" — NOT a bar chart
+  Per-site anomaly events table
+
+Page 3 — Anomaly Monitor:
+  4 severity KPI cards (critical/high/medium/low counts)
+  Timeline scatter plot coloured by severity
+  Anomaly score histogram
+  Anomaly count per site bar chart
+  Filterable events table
+
+Page 4 — Operator Chat:
+  st.chat_message UI, ⚡ avatar for assistant
+  POST to CHAT_AGENT_URL/chat (env var, default deployed URL)
+  Session history in st.session_state.chat_msgs
+  6 sample question buttons for demo quick-start
+  Tool usage footer per assistant message
+  DISABLE auto-refresh on this page (prevents conversation interruption)
+  Use _pending_chat session state pattern for button→input→submit flow
+
+Page 5 — Settings:
+  ML model info card
+  Infrastructure summary card
+  Anomaly threshold slider (contamination param)
+
+Sidebar (all pages):
+  Logo / title
+  Auto-refresh selector (15–300s)
+  Agent pulse indicator: green strobe if AI triage active in last 5 min
+  ACK gate (human-in-the-loop):
+    fetch_pending_acks() — LEFT JOIN anomaly_events + ack_events:
+      SELECT a.* FROM anomaly_events a
+      LEFT JOIN ack_events k ON k.site_id=a.site_id
+                             AND k.anomaly_timestamp=a.timestamp
+      WHERE k.site_id IS NULL
+        AND a.severity IN ('critical','high')
+        AND a.agent_summary LIKE '[AI Triage]%'
+        AND a.timestamp > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 6 HOUR)
+      ORDER BY severity (critical first), timestamp DESC
+      LIMIT 20
+    Show count badge + blinking red dot when pending > 0
+    Show ONE alert at a time (top of queue) with severity badge + summary
+    "✓ ACK" button → POST dispatch-agent/ack → cache_clear → rerun
+    Local session state set for instant visual feedback before BQ flush:
+      st.session_state.local_acks = set()  # (site_id, timestamp.isoformat())
+
+CRITICAL PLOTLY NOTE:
+  This project uses plotly 6.6.0. In this version, shorthand methods
+  fig.add_bar(), fig.add_scatter(), fig.add_histogram() SILENTLY DROP TRACES.
+  ALWAYS use fig.add_trace(go.Bar(...)), fig.add_trace(go.Scatter(...)) etc.
+  Per-bar marker_color list comprehensions also fail silently on large datasets.
+  Use a single colour string or a small explicit list instead.
+
+PANDAS NOTE:
+  BigQuery boolean columns use nullable BooleanDtype. Using == False raises
+  FutureWarning and may behave incorrectly. Always use .ne(True) instead:
+    df[df["acknowledged"].ne(True)]  not  df[df["acknowledged"] == False]
+
+================================================================================
+SECTION 7 — REPOSITORY STRUCTURE AND TOOLING
+================================================================================
+
+Repo: https://github.com/stanleyoz/microgrid_IIoT_demo (private)
+Local: /home/stanl/projects/g3cli_GCP_microgrid/
+
+Directory layout:
+  agents/           4 Cloud Run microservices, each: main.py, requirements.txt,
+                    Dockerfile (python:3.11-slim, port 8080, uvicorn)
+  dashboard/        dashboard_app.py, requirements.txt
+  edge/             sim_site.py, db2mqtt_microgrid.py, docker-compose.yml,
+                    Dockerfile (sim), ca.crt (gitignored), SSH keys (gitignored)
+  ml/               anomaly_detection_poc.ipynb, anomaly_detection_poc.py,
+                    generate_historical.py, spinup_notebook.sh
+  scripts/          check_GCP.sh
+  docs/             All .md, .txt documentation, diagrams, progress.txt
+  .github/workflows deploy.yml
+
+.gitignore must exclude: ca.crt, *.key, *.pem, id_microgrid_demo,
+  id_microgrid_demo.pub, .env, historical_data.csv, *.joblib, *.pdf,
+  venv/, __pycache__/, .claude/settings.local.json
+
+GitHub Actions CI/CD (deploy.yml):
+  Trigger: push to main + workflow_dispatch
+  Uses dorny/paths-filter@v3 to detect changed agents/* subdirectory
+  Only deploys the affected Cloud Run service(s)
+  GCP auth: google-github-actions/auth@v2 with secrets.GCP_SA_KEY
+  (SA: github-deploy@microgrid-demo.iam.gserviceaccount.com)
+  Roles: run.admin, cloudbuild.builds.editor, artifactregistry.writer,
+         storage.objectAdmin, iam.serviceAccountUser
+
+Deploy pattern per service:
+  gcloud run deploy SERVICE-NAME \
+    --source ./agents/SERVICE_DIR \
+    --region australia-southeast1 \
+    --project microgrid-demo \
+    --service-account microgrid-agent@microgrid-demo.iam.gserviceaccount.com \
+    --set-secrets=SECRET_NAME=secret-manager-name:latest \
+    --memory 512Mi --cpu 1 \
+    --[allow/no-allow]-unauthenticated \
+    --quiet
+
+Cloud Run service names use hyphens (triage-agent, chat-agent, dispatch-agent,
+anomaly-detector). Local directories use underscores. Do not confuse them.
+
+Vertex AI Workbench (for ML training only — NOT for serving):
+  Instance name: microgrid-anomaly-detection-notebook
+  Zone: australia-southeast1-a, Machine: n1-standard-4
+  TEAR DOWN after each training session to avoid ongoing VM costs.
+  ml/spinup_notebook.sh recreates it one-command when needed.
+  Model artefacts stored in GCS — Cloud Run loads from GCS, not from notebook.
+
+================================================================================
+SECTION 8 — SPRINT PLAN
+================================================================================
+
+Sprint 1 — Ingest foundation
+  - GCP project, IAM, Pub/Sub topics, BigQuery schema
+  - Mosquitto VM with TLS + password auth, Redis
+  - mqtt_to_pubsub.py bridge (systemd on VM)
+  - sim_site.py + docker-compose.yml (11 sites)
+  - db2mqtt_microgrid.py (hardware gateway)
+  - End-to-end validation: hardware telemetry → BQ confirmed
+
+Sprint 2 — ML + Dashboard
+  - Isolation Forest training notebook (Vertex AI Workbench)
+  - anomaly-detector Cloud Run service
+  - Pub/Sub pipeline wiring (anomaly-trigger-sub → /pubsub)
+  - Streamlit dashboard (all 4 pages, no chat yet)
+  - Auto-refresh, Plotly charts, SOC gauges
+
+Sprint 3 — Agentic AI layer
+  - triage-agent (LangGraph + Haiku) + cost controls
+  - dispatch-agent (LangGraph + Slack Block Kit)
+  - chat-agent (LangGraph ReAct + Sonnet)
+  - HITL ACK gate in dashboard sidebar
+  - Operator Chat page (Page 4)
+  - Human-in-the-loop full loop confirmed: anomaly → Slack → dashboard ACK → Slack green
+
+Sprint 4 — Demo polish (active)
+  - Forecast agent (SOC trajectory + OpenWeatherMap solar irradiance)
+  - Custom domain tinylab.ai → Cloud Run domain mapping
+  - Demo rehearsal script (10-minute walkthrough)
+  - LangSmith tracing for agent observability
+
+================================================================================
+SECTION 9 — COST CONTROLS AND KNOWN GOTCHAS
+================================================================================
+
+COST CONTROLS:
+  1. Triage cooldown (primary lever): 120 min non-demo, 5 min demo
+     At 1000 sites + 120 min: ~500 Haiku calls/hr = ~$504/month
+     At 1000 sites + 5 min:   ~12,000 calls/hr = $12,096/month — never in prod
+  2. Use Haiku (not Sonnet) for triage — 12× cheaper, sufficient for JSON classification
+  3. Vertex AI Workbench: delete instance after every training session
+  4. Severity-gated triage: only publish to microgrid-anomalies if score < -0.58
+     (high/critical) to reduce Haiku call volume by ~80% at scale
+
+BIGQUERY GOTCHAS:
+  - Streaming buffer blocks DML UPDATE for ~90 seconds after insert
+  - Pattern: use separate table + streaming INSERT + LEFT JOIN, never UPDATE
+  - This applies to both anomaly_events (triage) and ack_events (ACK gate)
+  - At 1000+ sites: add PARTITION BY DATE(timestamp) CLUSTER BY site_id
+
+CLOUD RUN GOTCHAS:
+  - Scale-to-zero means cold starts (~1-2s) — set min-instances=1 for anomaly-detector
+    at 100+ sites, min-instances=2 at 1000+ sites
+  - gcloud run deploy --source uses Cloud Build (build + push + deploy in one cmd)
+  - --allow-unauthenticated required for Streamlit→agent HTTP calls
+  - CORS middleware required on chat-agent and dispatch-agent for browser calls
+
+ANTHROPIC SDK GOTCHAS:
+  - Anthropic tool_use format differs from OpenAI: stop_reason vs finish_reason,
+    content blocks vs message.tool_calls, tool_result vs tool role
+  - Claude sometimes wraps JSON responses in ```json ... ``` fences even when
+    told not to — always strip fences before json.loads()
+  - Model IDs: claude-haiku-4-5-20251001, claude-sonnet-4-6
+
+GITHUB ACTIONS GOTCHAS:
+  - OAuth App tokens cannot push .github/workflows/ files — requires PAT with
+    workflow scope or re-auth with gh auth refresh -h github.com -s workflow
+  - Store GCP SA key as GCP_SA_KEY secret; generate to /tmp, store, then rm
+
+STREAMLIT GOTCHAS:
+  - st.columns([2,2,2]) raises warning — use st.columns(3) for equal widths
+  - Auto-refresh (st.rerun) interrupts chat input — disable on Operator Chat page
+  - st.cache_data.clear() required after ACK to force immediate refresh
+
+================================================================================
+SECTION 10 — DEVELOPMENT ENVIRONMENT
+================================================================================
+
+OS: Linux (WSL2 on Windows), kernel 6.6.87.2-microsoft-standard-WSL2
+Shell: bash
+Python: 3.11
+GCP auth: Application Default Credentials (gcloud auth application-default login)
+GitHub: authenticated as stanleyoz via gh CLI
+git: configured as stanleyoz / stanley.chong@live.com
+
+Installed tools: gcloud, gh, docker, docker compose, mosquitto_pub/sub,
+                 bq (BigQuery CLI), gsutil, streamlit, python3
+
+Key env vars (set in shell or .env, never committed):
+  ANTHROPIC_API_KEY     — for local agent testing
+  GOOGLE_CLOUD_PROJECT  — microgrid-demo
+  BROKER_HOST           — 34.87.254.184 (for docker compose simulator)
+
+Local Ollama (future/optional — do not implement unless explicitly requested):
+  RTX 4090 (24GB VRAM) on machine ae4090
+  Ollama serves OpenAI-compatible API at localhost:11434/v1
+  Candidate models: qwen2.5:7b (triage), qwen2.5:14b (chat)
+  Access from Cloud Run: via Tailscale (userspace-networking mode)
+  Toggle via model_config.json: {"provider": "anthropic"|"ollama", ...}
+
+================================================================================
+BEGIN IMPLEMENTATION — START WITH SPRINT 1
+================================================================================
