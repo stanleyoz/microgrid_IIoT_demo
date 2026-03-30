@@ -1,0 +1,374 @@
+================================================================================
+ SECURE CI/CD SETUP: LOCAL DEV → GITHUB → GCP CLOUD RUN
+ Microgrid IIoT Demo Project — Reference Document
+ Completed: 2026-03-30
+================================================================================
+
+OBJECTIVE
+---------
+Establish a professional, secure development workflow where:
+  1. All code is version-controlled in a private GitHub repository
+  2. Pushing code changes automatically deploys only the affected Cloud Run
+     service(s) to GCP — no manual gcloud commands required
+  3. GCP credentials are never stored in code or on disk long-term
+  4. Sensitive files (TLS certs, SSH keys, API keys) are permanently excluded
+     from version control
+
+This replaces the previous workflow of manually running multi-line
+gcloud run deploy commands after every change — error-prone and not traceable.
+
+
+================================================================================
+PART 1 — VERSION CONTROL SETUP (git + GitHub)
+================================================================================
+
+STEP 1.1 — Verify git identity is configured
+---------------------------------------------
+  git config --global user.name
+  git config --global user.email
+
+Why: Every commit is stamped with your name and email. Without this, git commits
+have no author identity, which matters for audit trails and collaboration.
+These are set once per machine in ~/.gitconfig.
+
+
+STEP 1.2 — Create .gitignore BEFORE git init
+---------------------------------------------
+Create a .gitignore file in the project root listing files that must NEVER
+enter version control. For this project the critical exclusions are:
+
+  ca.crt                — TLS certificate for the MQTT broker (public exposure
+                          would allow MITM attacks on sensor data)
+  id_microgrid_demo     — SSH private key for the GCP broker VM (exposure gives
+                          full shell access to the VM)
+  id_microgrid_demo.pub — Paired public key (exclude for hygiene)
+  .env                  — Environment files often contain API keys
+  venv/ / .venv/        — Python virtual environment (large, machine-specific,
+                          always recreatable from requirements.txt)
+  historical_data.csv   — Large generated data file (>100MB, not source code)
+  *.joblib              — Trained ML model files (stored in GCS, not git)
+  __pycache__/ *.pyc    — Python bytecode (generated, not source)
+  .claude/settings.local.json — Claude Code local session settings (personal)
+
+Why do this before git init? If you init first and accidentally commit a secret,
+it lives in git history even after deletion. Removing it requires rewriting
+history (git filter-branch / BFG), which is painful and risky. Prevention is
+the only reliable approach.
+
+
+STEP 1.3 — Initialise the local repository
+-------------------------------------------
+  cd /path/to/project
+  git init
+  git branch -M main      ← rename default branch from 'master' to 'main'
+                            (GitHub default, industry convention since 2020)
+
+Why git init here and not earlier? The project was built iteratively — git
+is most useful once the structure has stabilised and you have something worth
+preserving. Starting version control at a natural milestone (working system)
+gives a clean initial commit rather than a history full of half-working states.
+
+
+STEP 1.4 — Stage and make the initial commit
+--------------------------------------------
+  git add .
+  git status --short      ← review staged files BEFORE committing
+
+Review the staged list carefully — confirm no secrets are listed.
+If anything sensitive appears, add it to .gitignore and run git reset HEAD <file>.
+
+  git commit -m "initial commit: <meaningful description>"
+
+Why a meaningful commit message? The message is permanent. "initial commit:
+microgrid IIoT + agentic AI platform — 4-tier GCP pipeline, 4 Cloud Run
+agents, Streamlit dashboard" tells future-you (and collaborators) exactly what
+state this commit represents.
+
+
+================================================================================
+PART 2 — GITHUB REPOSITORY SETUP
+================================================================================
+
+STEP 2.1 — Authenticate GitHub CLI (gh)
+----------------------------------------
+The GitHub CLI (gh) must already be installed and authenticated:
+
+  gh auth status          ← check current login and token scopes
+
+Required token scopes for this workflow:
+  repo      — read/write access to repositories (push, create repos, secrets)
+  workflow  — create and update GitHub Actions workflow files (.github/workflows/)
+
+If 'workflow' scope is missing, re-authenticate:
+  gh auth refresh -h github.com -s workflow
+  (opens browser — complete the OAuth flow)
+
+Alternatively, create a Personal Access Token (PAT):
+  GitHub → Settings → Developer Settings → Personal Access Tokens → Classic
+  Check: repo (full) + workflow
+  Use in remote URL: https://YOUR_PAT@github.com/owner/repo.git
+
+Why a PAT over OAuth for workflow files? GitHub deliberately restricts OAuth
+App tokens from creating workflow files (security feature — prevents malicious
+OAuth apps from injecting CI/CD code). A PAT is user-issued and explicitly
+scoped, so GitHub permits it.
+
+
+STEP 2.2 — Create the private GitHub repository
+------------------------------------------------
+  gh repo create microgrid_IIoT_demo \
+    --private \
+    --description "Microgrid IIoT + Agentic AI Platform" \
+    --source=. \
+    --remote=origin \
+    --push
+
+Flags explained:
+  --private   Keeps GCP project IDs, broker IPs, topic names, and architecture
+              details out of public search indexes. Always use private for
+              infrastructure projects until you have deliberately sanitised them.
+  --source=.  Points to the current directory as the local source
+  --remote=origin  Sets the GitHub URL as the 'origin' remote in local git
+  --push      Pushes immediately after creating the repo
+
+Why 'origin'? Convention. git allows any remote name, but 'origin' is the
+universal default that every tool, tutorial, and colleague will expect.
+
+
+STEP 2.3 — Set remote URL with credentials (WSL2 workaround)
+-------------------------------------------------------------
+In WSL2, the default git credential helper may not work with the gh token.
+Embed credentials directly in the remote URL:
+
+  git remote set-url origin https://YOUR_PAT@github.com/owner/repo.git
+
+Security note: This stores the PAT in .git/config (plain text, local only).
+Acceptable on a personal dev machine. On a shared machine, use git credential
+manager instead. The PAT is not committed to the repository.
+
+
+================================================================================
+PART 3 — GCP SERVICE ACCOUNT FOR GITHUB ACTIONS
+================================================================================
+
+STEP 3.1 — Create a dedicated deployment service account
+---------------------------------------------------------
+  gcloud iam service-accounts create github-deploy \
+    --display-name="GitHub Actions Deploy" \
+    --project=microgrid-demo
+
+Why a dedicated SA and not reuse microgrid-agent?
+  - Principle of least privilege: each SA has only the permissions it needs
+  - microgrid-agent has BQ/Pub/Sub runtime permissions; github-deploy has
+    deployment permissions — these are different threat surfaces
+  - If the github-deploy key is ever leaked via GitHub, you can revoke and
+    rotate it without affecting the running production services
+  - Audit logs distinguish deployment actions from runtime actions
+
+
+STEP 3.2 — Grant deployment roles to the SA
+--------------------------------------------
+  roles/run.admin
+    → Create and update Cloud Run services and revisions
+
+  roles/cloudbuild.builds.editor
+    → Submit Cloud Build jobs (gcloud run deploy --source uses Cloud Build
+      to build the container image before deploying)
+
+  roles/artifactregistry.writer
+    → Push built container images to Artifact Registry (GCP's container
+      image store, replaces the older Container Registry)
+
+  roles/storage.objectAdmin
+    → Read/write the Cloud Build staging bucket where build context and
+      build logs are stored during gcloud run deploy --source
+
+  roles/iam.serviceAccountUser
+    → Allow github-deploy to "act as" the microgrid-agent runtime SA when
+      binding it to the Cloud Run service. Without this, the deploy command
+      fails with a permission error when setting --service-account.
+
+Command pattern:
+  gcloud projects add-iam-policy-binding PROJECT_ID \
+    --member="serviceAccount:github-deploy@PROJECT_ID.iam.gserviceaccount.com" \
+    --role="roles/ROLE_NAME"
+
+
+STEP 3.3 — Generate a JSON key for the SA
+------------------------------------------
+  gcloud iam service-accounts keys create /tmp/github-deploy-key.json \
+    --iam-account=github-deploy@microgrid-demo.iam.gserviceaccount.com
+
+This creates a JSON file containing the private key that proves identity to GCP.
+
+Security handling:
+  - Write to /tmp (not the project directory — never risks being git committed)
+  - Store in GitHub Secrets immediately (next step)
+  - Delete from disk after storing: rm /tmp/github-deploy-key.json
+  - The key is now only in GitHub's encrypted secret store and GCP IAM
+
+Why not use Workload Identity Federation (WIF) instead?
+  WIF is the more modern approach (no long-lived keys, uses OIDC tokens from
+  GitHub) and is recommended for production systems. For this solo dev project,
+  the SA JSON key approach is acceptable and simpler to set up. WIF is the
+  right next step if this project ever has team members or production SLAs.
+
+
+STEP 3.4 — Store the key as a GitHub Actions secret
+----------------------------------------------------
+  gh secret set GCP_SA_KEY \
+    --repo owner/repo \
+    --body "$(cat /tmp/github-deploy-key.json)"
+
+Why GitHub Secrets?
+  - Secrets are encrypted at rest by GitHub using libsodium
+  - They are never exposed in workflow logs (masked as ***)
+  - They are only available to Actions runs on the specific repo
+  - They cannot be read back via the API after being set (write-only)
+
+The workflow references this secret as ${{ secrets.GCP_SA_KEY }}.
+
+
+================================================================================
+PART 4 — GITHUB ACTIONS CI/CD WORKFLOW
+================================================================================
+
+File location: .github/workflows/deploy.yml
+This file must be committed to the repo to take effect.
+
+
+STEP 4.1 — Trigger strategy
+----------------------------
+  on:
+    push:
+      branches: [main]        ← fires on every push to main
+    workflow_dispatch:        ← also allows manual trigger from GitHub UI
+      inputs:
+        service: ...          ← pick which service to deploy manually
+
+Why main branch only? Protects against accidental deploys from feature
+branches. Only tested, reviewed code that has been merged to main deploys
+to production (Cloud Run).
+
+Why workflow_dispatch? Allows redeployment without a code change — useful
+when only a GCP Secret Manager secret changed (e.g. rotating the Slack
+webhook URL) and you need to force a fresh deploy to pick it up.
+
+
+STEP 4.2 — Path-based change detection
+----------------------------------------
+  uses: dorny/paths-filter@v3
+
+This action inspects which files changed in the push and outputs boolean
+flags per service directory:
+
+  triage:   triage_agent/**
+  chat:     chat_agent/**
+  dispatch: dispatch_agent/**
+  detector: anomaly_detector/**
+
+Why path filtering? Without it, every push deploys all 4 services even if
+only one file changed. Each Cloud Run deploy takes ~3 minutes (Cloud Build +
+image push + revision rollout). Deploying 4 services = 12 minutes of wasted
+CI time on every dashboard_app.py typo fix.
+
+With path filtering, editing triage_agent/main.py triggers only the
+triage-agent deploy (~3 min). The other 3 services are untouched.
+
+
+STEP 4.3 — GCP authentication step in each job
+-----------------------------------------------
+  - uses: google-github-actions/auth@v2
+    with:
+      credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+  - uses: google-github-actions/setup-gcloud@v2
+
+These two actions:
+  1. Authenticate to GCP as github-deploy SA using the stored JSON key
+  2. Install and configure the gcloud CLI in the Actions runner environment
+
+After these steps, all gcloud commands in subsequent steps run with the
+github-deploy SA identity.
+
+
+STEP 4.4 — Cloud Run deploy command
+-------------------------------------
+  gcloud run deploy SERVICE_NAME \
+    --source ./service_directory \    ← build from local source (uses Cloud Build)
+    --region australia-southeast1 \
+    --project microgrid-demo \
+    --service-account microgrid-agent@microgrid-demo.iam.gserviceaccount.com \
+    --set-secrets=SECRET_NAME=secret-manager-name:latest \
+    --memory 512Mi --cpu 1 \
+    --[allow/no-allow]-unauthenticated \
+    --quiet                           ← suppress interactive prompts
+
+Key flags:
+  --source          Sends the directory to Cloud Build which builds the Docker
+                    image and stores it in Artifact Registry automatically
+  --service-account Sets the RUNTIME identity of the Cloud Run service
+                    (microgrid-agent, not github-deploy)
+  --set-secrets     Mounts Secret Manager secrets as environment variables
+                    at runtime. The actual secret values never appear in the
+                    workflow file or logs.
+  --quiet           Required for non-interactive CI environments
+
+
+================================================================================
+PART 5 — DAY-TO-DAY WORKFLOW
+================================================================================
+
+Making a code change and deploying:
+
+  1. Edit code locally (e.g. triage_agent/main.py)
+  2. git add triage_agent/main.py
+  3. git commit -m "fix: increase triage context window to 60 minutes"
+  4. git push origin main
+
+GitHub Actions automatically:
+  - Detects triage_agent/ was changed
+  - Authenticates to GCP as github-deploy
+  - Runs gcloud run deploy triage-agent --source ./triage_agent
+  - New Cloud Run revision goes live with zero downtime (traffic shifted
+    automatically once the new revision passes health checks)
+
+Monitor at: https://github.com/stanleyoz/microgrid_IIoT_demo/actions
+
+
+Manual deploy (no code change):
+  GitHub → Actions → Deploy Cloud Run Services → Run workflow → select service
+
+
+================================================================================
+WHAT IS NOT COVERED HERE (FUTURE IMPROVEMENTS)
+================================================================================
+
+1. Workload Identity Federation (WIF)
+   Replace the JSON key with keyless authentication using GitHub's OIDC
+   tokens. More secure (no long-lived credentials), recommended for
+   production. Setup requires creating a Workload Identity Pool in GCP.
+
+2. Branch protection rules
+   Require pull request reviews before merging to main. Prevents direct
+   pushes to main triggering unreviewed deployments. Relevant once the
+   project has more than one contributor.
+
+3. Pre-deploy tests in CI
+   Add a 'test' job before the deploy jobs. Run pytest against the agent
+   code before allowing deployment. Currently skipped as the agents have
+   no unit test suite.
+
+4. Staging environment
+   Separate GCP project (microgrid-staging) where pushes to a 'develop'
+   branch deploy first. Only merges to main deploy to production. Relevant
+   once real customer data is involved.
+
+5. Secret rotation automation
+   The GCP SA JSON key has no automatic expiry. Set a calendar reminder
+   to rotate it every 90 days: delete the old key in GCP IAM, create a
+   new one, update the GitHub secret.
+
+================================================================================
+END OF DOCUMENT
+================================================================================
