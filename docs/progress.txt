@@ -55,13 +55,11 @@
 
 ### Next Steps: Access Notebook and Initial Code Generation
 
-You can access your Vertex AI Workbench instance by navigating to the following URL in your browser:
+Vertex AI Workbench
 
 [https://console.cloud.google.com/vertex-ai/workbench/instances/list?project=microgrid-demo&_Actions=launch_jupyterlab](https://console.cloud.google.com/vertex-ai/workbench/instances/list?project=microgrid-demo&_Actions=launch_jupyterlab)
 
-Once in JupyterLab, you will want to create a new notebook (e.g., `anomaly_detection_poc.ipynb`).
-
-Here is the initial Python code you can use in your new notebook to connect to BigQuery and fetch a sample of the `microgrid_telemetry` data for feature engineering:
+JupyterLab, notebook to connect to BigQuery and fetch a sample of the `microgrid_telemetry` data for feature engineering:
 
 ```python
 import pandas as pd
@@ -419,3 +417,149 @@ Files deleted (confirmed junk):
   anomaly_detection_poc.pdf    — generated artefact (notebook source kept)
 
 Reference doc: docs/setup_CICD_github_repo.txt — full CI/CD setup walkthrough
+
+## Phase 22: Cost Optimisation — Demo Sprint (Completed 2026-04-10)
+
+### Background
+Observed GCP opex of ~$3/day (incl. 10% GST). Root cause analysis revealed two
+issues: (1) Isolation Forest flagging ~91% of live telemetry as anomalous due to
+training distribution shift, cascading 14,500+ unnecessary Cloud Run invocations
+and BQ writes per day; (2) Cloud Run services over-provisioned with startup-cpu-boost
+and uncapped max-instances.
+
+### Fix 1 — Anomaly publish threshold (agents/anomaly_detector/main.py)
+- Added `PUBLISH_THRESHOLD = -0.65` constant
+- Both `/score` and `/pubsub` endpoints now gate on
+  `result["is_anomaly"] and result["score"] < PUBLISH_THRESHOLD`
+- Only critical-severity anomalies (score < -0.65) propagate to BQ + Pub/Sub
+- Reduces downstream events from ~14,500/day → ~1,400/day (90% reduction)
+- Pending: retrain Isolation Forest on current simulator data (Option B) to
+  fix the distribution shift properly before demo
+- Deployed via GitHub Actions (commit 1b6ea0b); also fixed missing
+  storage.admin permission on github-deploy SA (was blocking all future deploys)
+
+### Fix 2 — Remove startup-cpu-boost from all Cloud Run services
+- Removed `run.googleapis.com/startup-cpu-boost: true` from all 4 services
+- anomaly-detector, triage-agent, chat-agent, dispatch-agent all set to false
+- Services start in <2s — 2×CPU allocation on cold start was pure waste
+
+### Fix 3 — Cap max-instances to 3 on all Cloud Run services
+- anomaly-detector: 20 → 3
+- dispatch-agent:   20 → 3
+- triage-agent:     10 → 3
+- chat-agent:  unlimited → 3  (critical: default 1000 was a runaway billing risk)
+
+### Fix 4 — Billing export enabled
+- BigQuery billing export enabled on billing account 011C0D-96CE16-159A72
+- Dataset: microgrid-demo.billing_export
+- First rows arrive ~24h after enablement; query with:
+    SELECT service.description, sku.description, ROUND(SUM(cost),4) as usd
+    FROM `microgrid-demo.billing_export.gcp_billing_export_v1_*`
+    WHERE DATE(usage_start_time) = DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)
+    GROUP BY 1, 2 ORDER BY usd DESC
+
+### Remaining actions (Actions 5–6, pending)
+- Action 5: Switch VM to Spot provisioning (~$13/month saving) — flip back to
+  standard 24h before demo (see Demo Preparation section below)
+- Action 6: Stop simulator when not actively developing
+
+### Projected cost after all fixes
+  Current:              ~$3.00/day (incl. GST)
+  After fixes 1–4:      ~$1.80/day
+  + VM Spot:            ~$1.30/day
+  + Simulator idle 50%: ~$0.95/day
+
+---
+
+## Simulator & VM Operations — Demo Preparation Runbook
+
+### Stopping the simulator (when not actively developing)
+The Docker Compose simulator runs on the local laptop and generates continuous
+GCP traffic. Stop it whenever not in active use:
+
+    cd edge
+    docker compose down
+
+Verify stopped:
+    docker compose ps   # should show no running containers
+
+Cost impact: eliminates ~$0.30–0.40/day in Cloud Run + BQ + Pub/Sub variable costs.
+
+### Starting the simulator
+    cd edge
+    BROKER_HOST=34.87.254.184 BROKER_PORT=8883 docker compose up -d
+
+Verify data flowing:
+    bq query --project_id=microgrid-demo --use_legacy_sql=false \
+      "SELECT site_id, MAX(timestamp) as last_seen
+       FROM microgrid_db.microgrid_telemetry
+       GROUP BY site_id ORDER BY last_seen DESC LIMIT 5"
+    # All 11 sites should show timestamps within the last 2 minutes
+
+### Demo preparation sequence (T-24 hours before demo)
+
+#### Step 1 — Switch VM from Spot back to Standard (if Spot was enabled)
+    # Requires VM stop/start — ~2 min MQTT outage
+    gcloud compute instances stop microgrid-broker \
+      --zone=australia-southeast1-a --project=microgrid-demo
+
+    gcloud compute instances set-scheduling microgrid-broker \
+      --no-preemptible \
+      --project=microgrid-demo \
+      --zone=australia-southeast1-a
+
+    gcloud compute instances start microgrid-broker \
+      --zone=australia-southeast1-a --project=microgrid-demo
+
+    # Verify services recovered after restart
+    ssh -i edge/id_microgrid_demo stanl@34.87.254.184 \
+      "sudo systemctl status mosquitto mqtt-bridge redis-server --no-pager"
+
+#### Step 2 — Set triage cooldown to demo mode (5 minutes)
+Edit agents/triage_agent/main.py:
+    COOLDOWN = timedelta(minutes=5)   # was 120 for cost control
+Push to main — GitHub Actions redeploys triage-agent (~3 min).
+
+#### Step 3 — Start simulator 24 hours before demo
+    cd edge
+    BROKER_HOST=34.87.254.184 BROKER_PORT=8883 docker compose up -d
+
+This ensures all 11 sites have a full 24-hour telemetry horizon in the
+dashboard charts before the demo begins. Gaps in charts are visible to
+the audience — don't start the simulator cold on demo day.
+
+#### Step 4 — Verify full pipeline health
+    ./scripts/check_GCP.sh
+
+    # Quick BQ freshness check
+    bq query --project_id=microgrid-demo --use_legacy_sql=false \
+      "SELECT site_id, MAX(timestamp) as last_seen
+       FROM microgrid_db.microgrid_telemetry
+       GROUP BY site_id ORDER BY last_seen DESC LIMIT 5"
+
+    # Confirm anomalies flowing (with new threshold, ~1,400/day expected)
+    bq query --project_id=microgrid-demo --use_legacy_sql=false \
+      "SELECT COUNT(*) as anomalies_today
+       FROM microgrid_db.anomaly_events
+       WHERE DATE(timestamp) = CURRENT_DATE()"
+
+#### Step 5 — Open dashboard and do a dry run
+    streamlit run dashboard/dashboard_app.py
+    # Navigate all 5 pages, trigger a sample chat query, verify ACK gate
+
+### Post-demo teardown
+    # Stop simulator to halt GCP variable costs
+    cd edge && docker compose down
+
+    # Switch VM back to Spot (optional, for cost saving between events)
+    gcloud compute instances stop microgrid-broker \
+      --zone=australia-southeast1-a --project=microgrid-demo
+    gcloud compute instances set-scheduling microgrid-broker \
+      --preemptible \
+      --project=microgrid-demo --zone=australia-southeast1-a
+    gcloud compute instances start microgrid-broker \
+      --zone=australia-southeast1-a --project=microgrid-demo
+
+    # Reset triage cooldown to 120 minutes
+    # Edit agents/triage_agent/main.py: COOLDOWN = timedelta(minutes=120)
+    # Push to main
