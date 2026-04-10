@@ -19,6 +19,11 @@ DATASET_ID = "microgrid_db"
 ANOMALY_TABLE = "anomaly_events"
 ANOMALY_TOPIC = f"projects/{PROJECT_ID}/topics/microgrid-anomalies"
 
+# Only publish anomalies above this confidence level downstream (to Pub/Sub + BQ).
+# The model flags ~90% of readings due to training distribution shift; this gate
+# keeps only critical-severity events (score < -0.65) pending model retraining.
+PUBLISH_THRESHOLD = -0.65
+
 FEATURE_COLS = [
     "battery_v", "battery_soc", "battery_current", "battery_temp",
     "ac_input_v", "ac_output_v", "ac_input_power", "ac_output_power",
@@ -151,7 +156,7 @@ def score(payload: TelemetryPayload):
     p = payload.model_dump()
     result = run_scoring(p)
     ts = payload.timestamp or datetime.now(timezone.utc).isoformat()
-    if result["is_anomaly"]:
+    if result["is_anomaly"] and result["score"] < PUBLISH_THRESHOLD:
         write_anomaly_to_bq(payload.site_id, ts, result["score"], p)
     return {
         "site_id": payload.site_id,
@@ -185,10 +190,10 @@ async def pubsub_push(request: Request):
     ts = payload.get("timestamp") or datetime.now(timezone.utc).isoformat()
     site_id = payload.get("site_id", "unknown")
 
-    if result["is_anomaly"]:
+    if result["is_anomaly"] and result["score"] < PUBLISH_THRESHOLD:
         write_anomaly_to_bq(site_id, ts, result["score"], payload)
         log.info(f"ANOMALY: {site_id} score={result['score']:.4f}")
     else:
-        log.debug(f"Normal: {site_id} score={result['score']:.4f}")
+        log.debug(f"Suppressed/normal: {site_id} score={result['score']:.4f}")
 
     return {"status": "ok", "site_id": site_id, "is_anomaly": result["is_anomaly"]}
