@@ -544,8 +544,87 @@ the audience — don't start the simulator cold on demo day.
        WHERE DATE(timestamp) = CURRENT_DATE()"
 
 #### Step 5 — Open dashboard and do a dry run
-    streamlit run dashboard/dashboard_app.py
+    # Dashboard is now always-on — no local run needed
+    open https://microgrid.tinylab.ai
     # Navigate all 5 pages, trigger a sample chat query, verify ACK gate
+
+## Phase 23: Dashboard VM Migration — microgrid.tinylab.ai (Completed 2026-05-19)
+
+### Objective
+Move the Streamlit dashboard from the developer's local WSL laptop to the
+existing `microgrid-broker` VM so it is always-on and publicly accessible
+over HTTPS at `https://microgrid.tinylab.ai`.
+
+### Decision: VM over Cloud Run
+Streamlit is a stateful, long-lived WebSocket application. Cloud Run is
+fragile for this workload (idle connection timeouts, session state isolation
+across instances). The broker VM (e2-small) had ~700MB free RAM — sufficient
+headroom to run Streamlit alongside Mosquitto, Redis, and the bridge.
+
+### Infrastructure changes
+- **GCP firewall:** `allow-http-https` rule created — ports 80 and 443 opened
+  on `http-server` and `mqtt-server` network tags.
+- **DNS:** `A microgrid.tinylab.ai → 34.87.254.184` added at registrar.
+- **Nginx:** Installed as reverse proxy — TLS termination on 443, HTTP→HTTPS
+  redirect on 80, WebSocket upgrade headers for Streamlit's `/_stcore/stream`.
+- **Certbot:** Let's Encrypt certificate issued for `microgrid.tinylab.ai`;
+  auto-renews via systemd timer.
+- **Systemd unit:** `microgrid-dashboard.service` — Streamlit bound to
+  `127.0.0.1:8501`, `MemoryMax=1500M`, `Restart=always`, runs as `amplifiedengr`.
+- **Repo cloned to VM:** `/opt/microgrid` — `git pull` is now the update path.
+- **Python venv:** `/opt/microgrid/.venv` with dashboard dependencies.
+
+### New scripts committed to repo
+- `scripts/deploy_dashboard_vm.sh` — orchestrates full deploy from local machine
+  (firewall, IAM check, file copy, VM setup).
+- `scripts/vm_setup_dashboard.sh` — runs on the VM; installs packages, clones
+  repo, creates venv, enables services.
+- `scripts/microgrid-dashboard.service` — systemd unit file.
+- `scripts/nginx-microgrid.conf` — clean nginx config (post-certbot, no duplicate
+  server blocks).
+
+### Incident during migration: mqtt_to_pubsub.py lost
+During VM setup, `sudo rm -rf /opt/microgrid` was required to clear a
+pre-existing non-git directory before cloning. This deleted the original
+`mqtt_to_pubsub.py` and its venv — the file had never been in the GitHub repo.
+
+The running `mqtt-bridge` process (PID 62003, alive since 2026-03-26) survived
+in memory but began failing at 11:03 UTC with:
+  `OSError: Could not find a suitable TLS CA certificate bundle,
+   invalid path: /opt/microgrid/venv/lib/python3.11/site-packages/certifi/cacert.pem`
+
+**Recovery:**
+1. Recreated venv at `/opt/microgrid/venv` with original packages:
+   `certifi, google-cloud-pubsub, paho-mqtt, redis`.
+2. Reconstructed `mqtt_to_pubsub.py` from CLAUDE.md architecture description,
+   BQ schema, `sim_site.py` payload format, and Pub/Sub subscription inspection.
+   Key finding: bridge only publishes to Pub/Sub — `bq-ingest-sub` (native
+   Pub/Sub→BigQuery subscription) handles all BQ writes. No BQ client needed.
+3. Created new Mosquitto bridge credential (`mqtt-bridge` / `bridge-pass-secret`).
+4. `mqtt_to_pubsub.py` now committed to the repo — can never be lost again.
+
+### Verification
+- `https://microgrid.tinylab.ai` — accessible, green padlock, live fleet data.
+- All 5 services (`mosquitto`, `redis-server`, `mqtt-bridge`,
+  `microgrid-dashboard`, `nginx`) enabled in systemd and restart-safe on reboot.
+- BQ freshness confirmed post-recovery:
+  `site-08 | 2026-05-19 11:22:55` (continuous 60s cadence restored).
+
+### User-facing changes
+- Dashboard is now always-on at `https://microgrid.tinylab.ai` — no longer
+  requires the developer's laptop to be running.
+- Demo preparation step 5 changes: open `https://microgrid.tinylab.ai` in a
+  browser instead of running `streamlit run dashboard/dashboard_app.py` locally.
+- `check_GCP.sh` now also reports `microgrid-dashboard` and `nginx` status.
+- SSH access to VM should use `amplifiedengr@34.87.254.184` (GCP OS Login user),
+  not `stanl@34.87.254.184` (old key no longer works).
+- If the VM is rebooted: all services restart automatically. The only manual
+  recovery step needed after a reboot is if the Mosquitto `mqtt-bridge` credential
+  is missing from `/etc/mosquitto/passwd` — recreate with:
+    `sudo mosquitto_passwd -b /etc/mosquitto/passwd mqtt-bridge bridge-pass-secret`
+    `sudo systemctl reload mosquitto`
+
+---
 
 ### Post-demo teardown
     # Stop simulator to halt GCP variable costs
