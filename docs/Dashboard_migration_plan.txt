@@ -1,0 +1,292 @@
+  Dashboard VM Migration — Analysis and Implementation Plan
+
+  1. Current State
+
+  The Streamlit dashboard runs manually on the developer's WSL laptop (streamlit run dashboard/dashboard_app.py, port 8501). It authenticates to GCP via
+  Application Default Credentials (ADC) set up locally. It is not reachable from any other machine. For a conference demo at ODSC East (April 2026), it
+  needs to be:
+
+  - Always on and reachable from the internet
+  - Served over HTTPS (no browser insecurity warnings)
+  - Accessible via tinylab.ai (already referenced in st.set_page_config)
+
+  ---
+  2. Decision: VM vs Cloud Run
+
+  The user's instinct — VM over Cloud Run — is correct for this workload. Here is the reasoning:
+
+  ┌───────────────────────────┬─────────────────────────────────────────────────────────────────────────────────────┬──────────────────────────────────┐
+  │       Consideration       │                                      Cloud Run                                      │                VM                │
+  ├───────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────┤
+  │ Streamlit WebSocket       │ Fragile — Cloud Run terminates idle HTTP connections, WebSocket keep-alives can     │ Stable — persistent connections  │
+  │ connections               │ expire mid-session                                                                  │ with no timeout                  │
+  ├───────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────┤
+  │ Always-on cost            │ Requires --min-instances=1 to avoid cold starts; still billed at minimum 1 instance │ Fixed VM cost, no per-request    │
+  │                           │  24/7                                                                               │ billing                          │
+  ├───────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────┤
+  │ SSL/HTTPS                 │ Managed automatically by Google Front End                                           │ Manual setup, but one-time       │
+  │                           │                                                                                     │ 30-min task                      │
+  ├───────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────┤
+  │ Streamlit session state   │ Each Cloud Run instance has isolated memory; if load balancer routes two requests   │ Single process, single memory    │
+  │                           │ to different instances, session state is lost                                       │ space                            │
+  ├───────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────┤
+  │ st.cache_resource BQ      │ Re-initialised on cold start                                                        │ Persistent across sessions       │
+  │ client                    │                                                                                     │                                  │
+  └───────────────────────────┴─────────────────────────────────────────────────────────────────────────────────────┴──────────────────────────────────┘
+
+  Cloud Run works for stateless request/response services (the agents). Streamlit is a stateful, long-lived WebSocket application — a VM is the right
+  runtime.
+
+  ---
+  3. Decision: Existing Broker VM vs New VM
+
+  Existing broker VM (34.87.254.184, e2-small, 2 vCPU / 2GB RAM):
+  - Already running: Mosquitto, Redis, mqtt-bridge (3 systemd services)
+  - Already has static IP, existing SSH key access, microgrid-agent service account attached
+  - Streamlit idle memory footprint: ~150–200MB; current services use ~300MB → fits comfortably within 2GB
+
+  New dedicated VM (e2-micro, ~$7/month):
+  - Clean separation — VM outage doesn't simultaneously kill MQTT pipeline and dashboard
+  - Requires new IP, new DNS A record, new service account grant
+
+  Recommendation for demo phase: Use the existing broker VM. Adding Streamlit alongside Mosquitto/Redis on an e2-small is well within resource headroom. A
+  new VM adds cost and setup time with no meaningful benefit at 11-site demo scale. The separation argument becomes valid for production.
+
+  Reservation: If the MQTT bridge is the system's critical nerve centre, a runaway Streamlit process causing OOM would also kill the broker. This risk is
+  low but real. A 2GB memory limit on the Streamlit systemd unit mitigates it.
+
+  ---
+  4. HTTPS Architecture: Nginx + Let's Encrypt (Certbot)
+
+  The cleanest, most standard approach for a single VM:
+
+  Browser (HTTPS:443)
+      → Nginx (reverse proxy, TLS termination)
+          → Streamlit (localhost:8501, plain HTTP)
+
+  Nginx handles the TLS certificate, HTTPS→HTTP redirect, and WebSocket upgrade headers. Streamlit itself remains unchanged — it never needs to know about
+  SSL. Certbot (Let's Encrypt) issues a free certificate and auto-renews every 90 days via a systemd timer that already installs with modern Certbot
+  packages.
+
+  Why not Caddy? Caddy auto-HTTPS is simpler to configure but Nginx is already the standard on GCP VM tutorials, has better-documented Streamlit WebSocket
+  configuration, and the ops team has zero additional learning curve. Either works.
+
+  Why not Cloudflare Tunnel? The VM already has a static IP and the domain tinylab.ai. A tunnel adds Cloudflare as a dependency and a layer between user and
+   VM. Unnecessary given the existing setup.
+
+  ---
+  5. Full Implementation Plan
+
+  Step 1 — GCP Firewall Rules
+
+  The broker VM's firewall currently allows 22 (SSH), 1883, and 8883 (MQTT). Ports 80 and 443 need to be opened.
+
+  gcloud compute firewall-rules create allow-http-https \
+    --project=microgrid-demo \
+    --network=default \
+    --allow=tcp:80,tcp:443 \
+    --target-tags=microgrid-broker \
+    --description="Allow HTTP/HTTPS for dashboard"
+
+  Verify the VM has the microgrid-broker network tag (or adjust to match the actual tag on 34.87.254.184).
+
+  Step 2 — DNS
+
+  In the tinylab.ai DNS registrar, create:
+
+  A    tinylab.ai          34.87.254.184
+  A    www.tinylab.ai      34.87.254.184
+
+  If the dashboard should live on a subdomain:
+  A    dashboard.tinylab.ai   34.87.254.184
+
+  DNS propagation takes 5 minutes to a few hours depending on registrar TTL. Certbot requires DNS to resolve correctly before it can issue the certificate —
+   do this step first and wait for propagation before continuing.
+
+  Step 3 — Install Nginx and Certbot on the VM
+
+  ssh -i edge/id_microgrid_demo stanl@34.87.254.184
+
+  sudo apt update
+  sudo apt install -y nginx certbot python3-certbot-nginx
+
+  Step 4 — Deploy the Dashboard Code
+
+  The dashboard needs to run from the VM. Two approaches:
+
+  Option A — Clone the repo directly on the VM (recommended)
+  # On the VM
+  git clone https://github.com/stanleyoz/microgrid_IIoT_demo.git /opt/microgrid
+  cd /opt/microgrid
+  pip install -r dashboard/requirements.txt
+  Updates are then just git pull on the VM (or automate via GitHub Actions if desired).
+
+  Option B — Copy files only
+  # From local machine
+  scp -i edge/id_microgrid_demo -r dashboard/ stanl@34.87.254.184:/opt/microgrid/dashboard/
+
+  Step 5 — GCP Credentials for BigQuery
+
+  The VM already has the microgrid-agent service account attached (it's used by the mqtt-bridge for Pub/Sub). Verify it has BigQuery read access:
+
+  gcloud projects get-iam-policy microgrid-demo \
+    --flatten="bindings[].members" \
+    --filter="bindings.members:microgrid-agent" \
+    --format="table(bindings.role)"
+
+  If roles/bigquery.dataViewer is not listed, grant it:
+  gcloud projects add-iam-policy-binding microgrid-demo \
+    --member="serviceAccount:microgrid-agent@microgrid-demo.iam.gserviceaccount.com" \
+    --role="roles/bigquery.dataViewer"
+
+  Because the VM has the service account attached, bigquery.Client() in the dashboard code will authenticate automatically via the metadata server — no key
+  file, no GOOGLE_APPLICATION_CREDENTIALS needed. This is the correct GCP-native pattern.
+
+  Step 6 — Systemd Service for Streamlit
+
+  Create /etc/systemd/system/microgrid-dashboard.service:
+
+  [Unit]
+  Description=Microgrid Streamlit Dashboard
+  After=network.target
+
+  [Service]
+  User=stanl
+  WorkingDirectory=/opt/microgrid
+  ExecStart=/usr/local/bin/streamlit run dashboard/dashboard_app.py \
+      --server.port=8501 \
+      --server.address=127.0.0.1 \
+      --server.headless=true \
+      --server.enableCORS=false \
+      --server.enableXsrfProtection=false
+  Restart=always
+  RestartSec=10
+  MemoryMax=1500M
+  Environment=GCP_PROJECT_ID=microgrid-demo
+
+  [Install]
+  WantedBy=multi-user.target
+
+  Key flags:
+  - --server.address=127.0.0.1 — Streamlit binds to loopback only; Nginx handles the public interface
+  - --server.headless=true — suppresses the browser-open prompt and telemetry nag
+  - --server.enableCORS=false and --enableXsrfProtection=false — required when Nginx is the CORS/security layer; without these, Streamlit's own CORS checks
+  conflict with Nginx headers
+  - MemoryMax=1500M — prevents a memory leak from taking down Mosquitto/Redis on the same VM
+
+  Enable and start:
+  sudo systemctl daemon-reload
+  sudo systemctl enable microgrid-dashboard
+  sudo systemctl start microgrid-dashboard
+  sudo systemctl status microgrid-dashboard
+
+  Step 7 — Nginx Configuration
+
+  Create /etc/nginx/sites-available/microgrid:
+
+  server {
+      listen 80;
+      server_name tinylab.ai www.tinylab.ai;
+      return 301 https://$host$request_uri;
+  }
+
+  server {
+      listen 443 ssl;
+      server_name tinylab.ai www.tinylab.ai;
+
+      ssl_certificate     /etc/letsencrypt/live/tinylab.ai/fullchain.pem;
+      ssl_certificate_key /etc/letsencrypt/live/tinylab.ai/privkey.pem;
+      include             /etc/letsencrypt/options-ssl-nginx.conf;
+      ssl_dhparam         /etc/letsencrypt/ssl-dhparams.pem;
+
+      # WebSocket support — critical for Streamlit
+      location /_stcore/stream {
+          proxy_pass         http://127.0.0.1:8501/_stcore/stream;
+          proxy_http_version 1.1;
+          proxy_set_header   Upgrade $http_upgrade;
+          proxy_set_header   Connection "upgrade";
+          proxy_read_timeout 86400;
+      }
+
+      location / {
+          proxy_pass         http://127.0.0.1:8501;
+          proxy_http_version 1.1;
+          proxy_set_header   Host $host;
+          proxy_set_header   X-Real-IP $remote_addr;
+          proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+          proxy_set_header   X-Forwarded-Proto $scheme;
+          proxy_read_timeout 86400;
+      }
+  }
+
+  Enable and test:
+  sudo ln -s /etc/nginx/sites-available/microgrid /etc/nginx/sites-enabled/
+  sudo nginx -t   # must show "syntax is ok"
+
+  Step 8 — Issue Let's Encrypt Certificate
+
+  sudo certbot --nginx -d tinylab.ai -d www.tinylab.ai
+
+  Certbot will:
+  1. Verify domain ownership via HTTP-01 challenge (requires port 80 open and DNS resolved — hence Step 1 and Step 2 first)
+  2. Issue the certificate into /etc/letsencrypt/live/tinylab.ai/
+  3. Automatically patch the Nginx config with the ssl_certificate lines
+  4. Install a systemd timer for auto-renewal (certbot.timer runs twice daily, renews when <30 days remaining)
+
+  Reload Nginx after certificate issuance:
+  sudo systemctl reload nginx
+
+  Step 9 — Verify
+
+  # Check all four services are running
+  sudo systemctl status nginx microgrid-dashboard mosquitto mqtt-bridge --no-pager
+
+  # Test HTTPS from outside
+  curl -I https://tinylab.ai
+
+  # Check certificate
+  echo | openssl s_client -connect tinylab.ai:443 2>/dev/null | openssl x509 -noout -dates
+
+  Navigate to https://tinylab.ai — browser padlock should be green, no warnings.
+
+  ---
+  6. Access Control Consideration
+
+  With the dashboard public on tinylab.ai, anyone can view it. For the conference demo this is likely acceptable (read-only fleet data). However the ACK
+  gate posts to the dispatch agent via DISPATCH_AGENT_URL, which could be misused.
+
+  Minimal protection options (in order of effort):
+
+  1. Streamlit [server] enableXsrfProtection=true + secrets — Streamlit has a built-in secrets.toml mechanism that can gate access. Add a simple password
+  check at the top of dashboard_app.py.
+  2. Nginx Basic Auth — One .htpasswd file, three config lines, zero code changes.
+  3. IP allowlist in Nginx — allow <conference IP range>; deny all; in the location block.
+
+  For the demo, option 2 (Nginx Basic Auth) is the lowest-friction addition that prevents casual access while keeping the demo smooth for invited attendees.
+
+  ---
+  7. Summary of Changes
+
+  ┌────────────────────────────┬────────────────────────────────────────────────────┬──────────────────────────────────────┐
+  │            What            │                       Where                        │                Notes                 │
+  ├────────────────────────────┼────────────────────────────────────────────────────┼──────────────────────────────────────┤
+  │ GCP firewall: open 80, 443 │ GCP console / gcloud                               │ One-time                             │
+  ├────────────────────────────┼────────────────────────────────────────────────────┼──────────────────────────────────────┤
+  │ DNS A record               │ Domain registrar                                   │ Do first, wait for propagation       │
+  ├────────────────────────────┼────────────────────────────────────────────────────┼──────────────────────────────────────┤
+  │ apt install nginx certbot  │ Broker VM                                          │ No code changes                      │
+  ├────────────────────────────┼────────────────────────────────────────────────────┼──────────────────────────────────────┤
+  │ Systemd unit for Streamlit │ /etc/systemd/system/microgrid-dashboard.service    │ New file                             │
+  ├────────────────────────────┼────────────────────────────────────────────────────┼──────────────────────────────────────┤
+  │ Nginx config               │ /etc/nginx/sites-available/microgrid               │ New file                             │
+  ├────────────────────────────┼────────────────────────────────────────────────────┼──────────────────────────────────────┤
+  │ Let's Encrypt cert         │ certbot --nginx                                    │ Free, auto-renews                    │
+  ├────────────────────────────┼────────────────────────────────────────────────────┼──────────────────────────────────────┤
+  │ dashboard/requirements.txt │ No change                                          │ Already has all deps                 │
+  ├────────────────────────────┼────────────────────────────────────────────────────┼──────────────────────────────────────┤
+  │ dashboard_app.py           │ No change                                          │ Already has tinylab.ai in page title │
+  ├────────────────────────────┼────────────────────────────────────────────────────┼──────────────────────────────────────┤
+  │ check_GCP.sh               │ Optional: add systemctl status microgrid-dashboard │ Housekeeping                         │
+  └────────────────────────────┴────────────────────────────────────────────────────┴──────────────────────────────────────┘
+
+  The dashboard code itself requires zero modifications. All changes are infrastructure: firewall, DNS, systemd, Nginx, and Certbot.

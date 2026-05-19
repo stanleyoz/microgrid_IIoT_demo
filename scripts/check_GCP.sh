@@ -50,6 +50,12 @@ gcloud storage buckets list \
   --format="table(name,location,storageClass)"
 
 echo ""
+echo "--- DASHBOARD VM SERVICE (broker VM) ---------------------------"
+ssh -i edge/id_microgrid_demo -o StrictHostKeyChecking=accept-new \
+    stanl@34.87.254.184 \
+    "sudo systemctl status microgrid-dashboard nginx --no-pager -l 2>/dev/null || echo 'Dashboard service not yet deployed'"
+
+echo ""
 echo "================================================================"
 echo " Done."
 echo "================================================================"
