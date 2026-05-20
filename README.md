@@ -1,6 +1,6 @@
 # Microgrid IIoT + Agentic AI Platform
 
-**End-to-end industrial IoT intelligence for off-grid solar+battery microgrids — anomaly detection, AI-powered fault triage, operator chat, and human-in-the-loop alerting on Google Cloud Platform.**
+**End-to-end industrial IoT intelligence for off-grid solar+battery microgrids — anomaly detection, Agentic LLM for fault triage, operator chat, and human-in-the-loop alerting on Google Cloud Platform.**
 
 Live demo: **[microgrid.tinylab.ai](https://microgrid.tinylab.ai)** · Built by [Amplified Engineering](https://amplified.com.au) · Demonstrated at ODSC East, April 2026
 
@@ -42,8 +42,8 @@ End-to-end latency from fault to Slack alert: **~15 seconds**.
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
 │  TIER 1 — EDGE                                                       │
-│  Victron MultiPlus 24V · LiFePO4 banks · Rooftop PV                 │
-│  Modbus TCP → SQLite → MQTT/TLS :8883 → GCP broker                  │
+│  Victron MultiPlus 24V · LiFePO4 banks · Rooftop PV                  │
+│  Modbus TCP → SQLite → MQTT/TLS :8883 → GCP broker                   │
 │  11 Docker-simulated sites + 1 live hardware node                    │
 └──────────────────────────┬───────────────────────────────────────────┘
                            │  MQTT TLS, 60-second cadence
@@ -248,4 +248,4 @@ Push to `main` → GitHub Actions detects which `agents/*` subdirectory changed 
 
 ---
 
-*Built with [Claude Code](https://claude.ai/code) · Powered by [Anthropic Claude](https://anthropic.com) · Deployed on Google Cloud Platform*
+*Deployed on Google Cloud Platform*
