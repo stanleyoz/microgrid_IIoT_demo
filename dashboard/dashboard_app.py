@@ -129,6 +129,12 @@ def get_bq():
 
 client = get_bq()
 
+def _to_sgt(df):
+    """Convert UTC timestamp column to SGT (UTC+8) for display."""
+    if not df.empty and "timestamp" in df.columns:
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True).dt.tz_convert("Asia/Singapore")
+    return df
+
 @st.cache_data(ttl=30)
 def fleet_latest():
     q = f"""
@@ -139,9 +145,7 @@ def fleet_latest():
     ) WHERE rn = 1 ORDER BY site_id
     """
     df = client.query(q).to_dataframe()
-    if not df.empty:
-        df["timestamp"] = pd.to_datetime(df["timestamp"])
-    return df
+    return _to_sgt(df)
 
 @st.cache_data(ttl=30)
 def site_history(site_id, hours=24):
@@ -154,9 +158,7 @@ def site_history(site_id, hours=24):
     ORDER BY timestamp ASC
     """
     df = client.query(q).to_dataframe()
-    if not df.empty:
-        df["timestamp"] = pd.to_datetime(df["timestamp"])
-    return df
+    return _to_sgt(df)
 
 @st.cache_data(ttl=15)
 def fetch_agent_activity():
@@ -171,8 +173,8 @@ def fetch_agent_activity():
     """
     try:
         df = client.query(q).to_dataframe()
+        df = _to_sgt(df)
         if not df.empty:
-            df["timestamp"] = pd.to_datetime(df["timestamp"])
             return True, df.iloc[0]
     except Exception:
         pass
@@ -198,10 +200,7 @@ def fetch_pending_acks():
     LIMIT 20
     """
     try:
-        df = client.query(q).to_dataframe()
-        if not df.empty:
-            df["timestamp"] = pd.to_datetime(df["timestamp"])
-        return df
+        return _to_sgt(client.query(q).to_dataframe())
     except Exception:
         return pd.DataFrame()
 
@@ -215,12 +214,33 @@ def fetch_anomalies(site_id=None, limit=300):
     {where}
     ORDER BY timestamp DESC LIMIT {limit}
     """
-    df = client.query(q).to_dataframe()
-    if not df.empty:
-        df["timestamp"] = pd.to_datetime(df["timestamp"])
-    return df
+    return _to_sgt(client.query(q).to_dataframe())
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+def require_telemetry(df, empty_msg="No telemetry received in the last 15 minutes.",
+                      max_retries=3):
+    """Self-healing guard for a fleet_latest() result.
+
+    A cold first browser load can cache an empty/partial BigQuery result, which
+    used to dead-end the page via st.stop() until the user manually reloaded.
+    Instead, drop the cached-empty result and rerun a bounded number of times so
+    the page recovers on its own. Only after max_retries do we treat it as a real
+    outage and stop. Returns df unchanged when it has data (and resets the
+    retry counter)."""
+    if not df.empty:
+        st.session_state.pop("_telemetry_retries", None)
+        return df
+    tries = st.session_state.get("_telemetry_retries", 0)
+    if tries < max_retries:
+        st.session_state["_telemetry_retries"] = tries + 1
+        st.info("Connecting to telemetry… (loading)")
+        st.cache_data.clear()
+        time.sleep(2)
+        st.rerun()
+    st.session_state.pop("_telemetry_retries", None)
+    st.warning(empty_msg)
+    st.stop()
+
 def kpi(value, label, color=None):
     style = f"color:{color}" if color else ""
     return (f'<div class="kpi">'
@@ -372,9 +392,7 @@ if page == "Fleet Overview":
     df = fleet_latest()
     an = fetch_anomalies(limit=500)
 
-    if df.empty:
-        st.info("No telemetry received in the last 15 minutes.")
-        st.stop()
+    df = require_telemetry(df)
 
     active_alarms = (
         an[an["acknowledged"].ne(True)].groupby("site_id").size().to_dict()
@@ -445,10 +463,7 @@ if page == "Fleet Overview":
 elif page == "Site Details":
     st.markdown("## Site Details")
 
-    df_fleet = fleet_latest()
-    if df_fleet.empty:
-        st.info("No live data available.")
-        st.stop()
+    df_fleet = require_telemetry(fleet_latest(), empty_msg="No live data available.")
 
     col_sel, col_hrs = st.columns([2, 1])
     with col_sel:
