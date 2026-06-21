@@ -1,0 +1,155 @@
+================================================================================
+ CUSTOMER TRIAL SDK — WET-RUN TEST REPORT
+ Customer: customer-test-001
+================================================================================
+Date            : 2026-06-21
+Performed by    : tinylab.ai (Amplified Engineering)
+Platform        : Microgrid IIoT + Agentic AI (microgrid.tinylab.ai)
+Result          : PASS — full build → deploy → install → visualize cycle validated
+                  (one client-side defect found and fixed during the run)
+
+--------------------------------------------------------------------------------
+1. OBJECTIVE
+--------------------------------------------------------------------------------
+Validate the end-to-end Customer Trial SDK on a real client install: generate a
+per-customer installer bundle, deliver it, install it on a remote Linux machine,
+activate the data collector, and confirm the customer's data appears ONLY on
+their private, isolated dashboard — with no manual VM reconfiguration.
+
+--------------------------------------------------------------------------------
+2. TRIAL IDENTITY
+--------------------------------------------------------------------------------
+Customer name   : customer-test-001
+GUID            : <GUID>
+Device / site   : cust-<GUID>-01
+Dashboard URL   : https://microgrid.tinylab.ai/c/?c=<GUID>
+Trial window    : 12 h (provision-time clock; expires ~18:40 UTC 2026-06-21)
+Broker          : 34.87.254.184:8883 (MQTT/TLS, per-device password + ACL)
+
+--------------------------------------------------------------------------------
+3. STAGE 1 — BUILD (operator side)
+--------------------------------------------------------------------------------
+Provisioning (on broker VM):
+    onboard_customer.sh "customer-test-001" 12 1
+    -> issued credential cust-<GUID>-01
+    -> wrote registry /var/lib/microgrid-registry/<GUID>.json (status active)
+    -> scheduled systemd-run auto-revoke timer at T+12h
+
+Packaging (operator workstation):
+    build_bundle.sh <onboard.json> --interval 30 --feeder --format zip
+    -> dist/microgrid-sdk-<GUID>.zip  (10 files)
+       install.sh, uninstall.sh, forwarder.py, microgrid-gateway.service,
+       requirements.txt, ca.crt, gateway.conf (pre-filled identity), INSTALL.txt,
+       sensor_feed.sh (test feeder)
+
+One-command equivalent (for future website automation):
+    build_customer_sdk.sh "customer-test-001"   (onboard + package in one step)
+
+Result: PASS — bundle generated; gateway.conf correctly carried site_id, broker
+host, credential and interval. No per-customer dashboard/nginx/VM change needed.
+
+--------------------------------------------------------------------------------
+4. STAGE 2 — DELIVER TO CUSTOMER
+--------------------------------------------------------------------------------
+Bundle zip transferred to the customer machine (email / scp). Bundle contains no
+operator secrets; the only sensitive item is the device's own MQTT credential,
+scoped by ACL to its own topic.
+
+Result: PASS.
+
+--------------------------------------------------------------------------------
+5. STAGE 3 — CUSTOMER DEPLOYMENT (remote machine)
+--------------------------------------------------------------------------------
+Machine         : WSL Ubuntu 24.04 (x86-64), host stanP16v
+Command         : sudo bash install.sh
+
+Observed:
+  - Dependencies installed (mosquitto, mosquitto-clients, python3-venv)
+  - Local broker port 1883 in use -> auto-bumped to 1884 (reported to user)
+  - Installed to /opt/microgrid-gateway; Python venv created
+  - Local broker configured on 0.0.0.0:1884 (anonymous, trusted-network warning)
+  - systemd service 'microgrid-gateway' registered and started (Restart=always)
+  - Summary printed: site id, local broker endpoint, expiry, quick-test command
+
+Activation (test feeder):
+    bash sensor_feed.sh           # auto-detected port 1884
+  -> published realistic values to the 5 local topics every 2 s
+  -> forwarder assembled the 17-field schema and published to
+     microgrid/cust-<GUID>-01/telemetry over TLS
+
+Result: PASS — install clean; service auto-started; data collector activated.
+
+--------------------------------------------------------------------------------
+6. DEFECT FOUND & RESOLVED (during the run)
+--------------------------------------------------------------------------------
+Defect          : The first-issued bundle's test feeder was a Python script
+                  requiring 'paho'. The customer's SYSTEM python3 has no paho,
+                  and Debian/Ubuntu (PEP-668, externally-managed) blocks
+                  'pip install'. Feeder failed: ModuleNotFoundError: paho.
+                  Secondary friction: feeder default port (1883) did not match
+                  the auto-bumped local port (1884).
+
+Resolution      : Replaced the Python feeder with sensor_feed.sh using
+                  mosquitto_pub (mosquitto-clients is already installed by
+                  install.sh — zero extra dependency). It auto-detects the local
+                  port from gateway.conf, so there is no port to remember.
+                  install.sh now prints a ready-to-run 'bash sensor_feed.sh'
+                  hint with the resolved port.
+
+Verification    : New shell feeder validated in a Debian container (all 5 topics
+                  published, awk math correct). Re-install on WSL was clean and
+                  'bash sensor_feed.sh' worked first try.
+
+Commit          : cf558a5 "fix: ship mosquitto_pub shell test feeder
+                  (remove paho/PEP-668 friction)"
+
+--------------------------------------------------------------------------------
+7. RESULTS — VERIFICATION
+--------------------------------------------------------------------------------
+Customer dashboard (https://microgrid.tinylab.ai/c/?c=<GUID>):
+  - Titled "customer-test-001"; nav scoped to Fleet Overview + Site Details only
+  - 1 active site cust-<GUID>-01; live KPIs (Solar 1458 W, Load 633 W,
+    SOC 40%, NORMAL); Solar-vs-Load chart rendering
+  - AI Agent Status: "Triage Agent Idle" (anomaly/triage correctly OFF for
+    customer sites)
+
+BigQuery (microgrid_db.microgrid_telemetry), last 10 min:
+  - site_id cust-<GUID>-01: 7 rows, SOC 40.0–79.7%, solar max 1782 W,
+    freshness lag ~25 s
+
+Isolation (privacy):
+  - Main demo dashboard query (NOT LIKE 'cust-%'): 11 demo sites, 0 customer
+    rows leaked
+  - Customer view query (LIKE 'cust-<GUID>-%'): customer site only
+  - Broker ACL: device limited to its own microgrid/<site>/# topic
+
+Result: PASS — data flows remote machine -> local broker -> forwarder (TLS) ->
+broker ACL -> mqtt_to_pubsub bridge -> Pub/Sub -> BigQuery -> private /c/
+dashboard, fully isolated from the demo fleet and any other customer.
+
+--------------------------------------------------------------------------------
+8. CONCLUSION
+--------------------------------------------------------------------------------
+The Customer Trial SDK passed the wet run end-to-end on a real client install.
+The build/deliver/install/activate/visualize workflow works as designed with no
+per-customer VM reconfiguration. One client-side packaging defect (Python/paho
+feeder) was found and fixed in the template; the corrected bundle installs and
+activates cleanly.
+
+--------------------------------------------------------------------------------
+9. OUTSTANDING / NEXT
+--------------------------------------------------------------------------------
+  - Re-run on Raspberry Pi 5 (arm64) using the corrected bundle. Pre-checks:
+    system clock NTP-synced (TLS), outbound TCP 8883 permitted.
+  - Known gap: deleting the MQTT credential at T+12h (or on off-board) denies
+    RECONNECTS but does not drop an already-connected MQTT session (mosquitto
+    keeps live clients on a passwd reload). Client-side 12h self-stop covers the
+    honest case; for hard VM-side cutoff, add a bridge-level check in
+    mqtt_to_pubsub.py that drops messages from sites whose registry entry is
+    missing/expired. (Not yet implemented.)
+  - Teardown when testing concludes: 'sudo bash uninstall.sh' on the device;
+    offboard_customer.sh <GUID> on the VM (or let the 12h timer auto-revoke).
+
+================================================================================
+ END OF REPORT
+================================================================================
