@@ -10,7 +10,8 @@ Full spec: [`docs/customer_sdk_requirements.md`](../docs/customer_sdk_requiremen
 ## Status
 
 - **Phase 1 — forwarder + local contract — DONE & tested** (this directory).
-- Phase 2 — installer (`install.sh`, port-bump, systemd) — pending.
+- **Phase 2 — installer (`install.sh`, port-bump, systemd) — DONE & tested**
+  (verified end-to-end in a clean Ubuntu 24.04 container).
 - Phase 3 — VM provisioning (mosquitto user + ACL + 12h revocation) — pending.
 - Phase 4 — main-dashboard exclusion + scoped `/c/<guid>` dashboard — pending.
 - Phase 5 — bundle generator + end-to-end dry run — pending.
@@ -20,6 +21,9 @@ Full spec: [`docs/customer_sdk_requirements.md`](../docs/customer_sdk_requiremen
 ```
 templates/
   forwarder.py        local-broker → VM forwarder (paho, TLS, 12h self-stop)
+  install.sh          customer installer (multi-arch deps, port-bump, systemd)
+  uninstall.sh        removes service, broker drop-in, install dir
+  microgrid-gateway.service  systemd unit for the forwarder
   gateway.conf.tmpl   config template (generator fills {{PLACEHOLDERS}})
   requirements.txt    paho-mqtt>=2.0
 test/
