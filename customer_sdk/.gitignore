@@ -2,3 +2,4 @@
 test/gateway.*.conf
 __pycache__/
 *.pyc
+dist/
