@@ -12,7 +12,10 @@ Full spec: [`docs/customer_sdk_requirements.md`](../docs/customer_sdk_requiremen
 - **Phase 1 — forwarder + local contract — DONE & tested** (this directory).
 - **Phase 2 — installer (`install.sh`, port-bump, systemd) — DONE & tested**
   (verified end-to-end in a clean Ubuntu 24.04 container).
-- Phase 3 — VM provisioning (mosquitto user + ACL + 12h revocation) — pending.
+- **Phase 3 — VM provisioning scripts (mosquitto user + ACL + 12h revocation)
+  — BUILT & ACL-tested in isolation; NOT yet applied to the live broker.**
+  See `server/`. Applying `enable_acl.sh` to production is a live-impacting
+  step held for explicit operator approval.
 - Phase 4 — main-dashboard exclusion + scoped `/c/<guid>` dashboard — pending.
 - Phase 5 — bundle generator + end-to-end dry run — pending.
 
@@ -29,6 +32,11 @@ templates/
 test/
   publish_sensors.py  fake edge sensors (5 local topics)
   verify_uplink.py    validates uplink against the 17-field sim_site schema
+server/               (run on the broker VM as root)
+  aclfile             topic ACL: pattern write microgrid/%u/# + bridge read
+  enable_acl.sh       ONE-TIME, live-impacting: enable ACL (backup + auto-rollback)
+  provision_customer.sh    add cust-<guid> credential + schedule 12h revocation
+  deprovision_customer.sh  delete credential + reload (auto-run at T+12h)
 ```
 
 ## Local contract (customer → local broker)

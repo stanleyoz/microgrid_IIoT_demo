@@ -107,10 +107,10 @@ See §8.
   user mqtt-bridge
   topic read microgrid/#
 
-  pattern write microgrid/%u/telemetry
+  pattern write microgrid/%u/#
   ```
-  The `%u` pattern locks every device (demo + customer) to publishing only `microgrid/<its-username>/telemetry`.
-- **Caution (implementation):** before enabling the ACL, verify every existing publisher (`site-01..11`, `hw-node-01`) publishes to `microgrid/<username>/telemetry` (i.e. username == topic site id) so the pattern rule does not break the live demo/hardware feeds. Add explicit per-user rules for any that differ.
+  The `%u` pattern locks every device (demo + customer) to publishing only within its **own** site subtree `microgrid/<username>/#`.
+- **Verified (2026-06-21):** existing publishers are `site-01..11` (→ `microgrid/site-NN/telemetry`), `hw-node-01` (→ `microgrid/hw-node-01/telemetry` **and** `microgrid/hw-node-01/gps`), and `mqtt-bridge` (subscribes only). The rule is `%u/#` (not `%u/telemetry`) specifically so the hardware node's secondary `/gps` topic keeps working. Tested in an isolated broker: all existing publishers preserved (incl. hw GPS), and a `cust-*` user is denied both publishing to and subscribing from any other site.
 - Add the customer user: `mosquitto_passwd -b /etc/mosquitto/passwd cust-<guid> <secret>`, then reload mosquitto.
 
 ### 12h enforcement (two simple layers)
