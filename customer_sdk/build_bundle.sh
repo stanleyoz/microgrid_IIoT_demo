@@ -53,11 +53,12 @@ service_name = microgrid-gateway
 EOF
 
 if [ "$FEEDER" = "1" ]; then
-    cp "$SELF/test/publish_sensors.py" "$BDIR/sensor_feed.py"
+    cp "$SELF/templates/sensor_feed.sh" "$BDIR/sensor_feed.sh"
+    chmod +x "$BDIR/sensor_feed.sh"
     FEEDER_NOTE="
-A test sensor feeder is bundled. To populate the dashboard without real sensors:
-    python3 sensor_feed.py --host 127.0.0.1 --port <LOCAL_PORT> --interval 2
-(LOCAL_PORT is printed by install.sh — usually 1883.)"
+A test sensor feeder is bundled (no Python needed — uses mosquitto_pub and
+auto-detects the local port). To populate the dashboard without real sensors:
+    bash sensor_feed.sh"
 else
     FEEDER_NOTE="
 Publish your sensor values to the local broker (plain numbers), e.g.:

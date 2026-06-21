@@ -176,6 +176,9 @@ cat <<EOF
     mosquitto_pub -h 127.0.0.1 -p $PORT -t load_demand     -m 540
     mosquitto_pub -h 127.0.0.1 -p $PORT -t inverter_temp   -m 34.1
 EOF
+if [ -f "$BUNDLE_DIR/sensor_feed.sh" ]; then
+    echo "  Quick test feed    : bash $BUNDLE_DIR/sensor_feed.sh   (auto-detects port $PORT)"
+fi
 if [ "$SERVICE_REGISTERED" = "1" ]; then
     echo "  Service status     : systemctl status $SERVICE_NAME"
     echo "  Live logs          : journalctl -u $SERVICE_NAME -f"
