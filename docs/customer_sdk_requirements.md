@@ -1,6 +1,8 @@
 # Customer Trial SDK — Requirements Specification
 
-**Status:** Approved for design (2026-06-21) · **Owner:** tinylab.ai · **Type:** v1 demo / sales trial feature
+**Status:** Deployed live on the broker VM (2026-06-21, PR #1) · **Owner:** tinylab.ai · **Type:** v1 demo / sales trial feature
+
+> All phases built, tested offline, and the live window applied: broker ACL enabled (demo ingest unaffected), main dashboard excludes `cust-*`, customer-view instance on `:8502` behind nginx `/c/`. End-to-end verified with a throwaway test customer (onboard → TLS forward → BigQuery scoped → `/c/` dashboard → off-board → reconnect denied). One known gap remains — see §8.
 
 ## 1. Purpose
 
@@ -128,10 +130,12 @@ See §8.
 - Add the customer user: `mosquitto_passwd -b /etc/mosquitto/passwd cust-<guid> <secret>`, then reload mosquitto.
 
 ### 12h enforcement (two simple layers)
-- **Authoritative (VM):** at provisioning, schedule a job (systemd-timer or `at`) at **T+12h** that runs `mosquitto_passwd -D cust-<guid>` (delete user) + reloads mosquitto, and stops/removes the scoped dashboard instance. After this, the publisher can no longer authenticate and no data is processed.
+- **Authoritative (VM):** at provisioning, a `systemd-run` timer at **T+12h** runs `deprovision_customer.sh` → `mosquitto_passwd -D cust-<guid>-<NN>` (delete credential) + reloads mosquitto. After this the gateway can no longer authenticate.
 - **Courtesy (client):** `forwarder.py` self-terminates at T+12h.
-- **Clock start:** provisioning time (simplest; matches sequential manual onboarding).
+- **Clock start:** provisioning time.
 - **Expiry UX:** none required — the site drops off the dashboard's 15-min window naturally.
+
+> **Known gap (as of 2026-06-21):** deleting the mosquitto credential denies *reconnects* but does **not** drop an already-connected MQTT session (mosquitto keeps live clients on a passwd reload). The client self-stop covers the honest case; a determined client staying connected could publish past 12h. To hard-enforce VM-side, add a check in `mqtt_to_pubsub.py` that drops messages from sites whose registry entry is missing/expired (a bridge-level change, not yet implemented).
 
 ## 9. Private dashboard (scoped Streamlit)
 
@@ -161,14 +165,15 @@ See §8.
 
 ## 12. Verified current VM state (2026-06-21)
 
-- Single VM `microgrid-broker` (australia-southeast1-a), mosquitto TLS:8883, `allow_anonymous false`, `password_file /etc/mosquitto/passwd`, **no ACL file configured**.
+- Single VM `microgrid-broker` (australia-southeast1-a), mosquitto TLS:8883, `allow_anonymous false`, `password_file /etc/mosquitto/passwd`. ACL now enabled (`conf.d/acl.conf` + `aclfile`).
 - Bridge `mqtt_to_pubsub.py` (`/opt/microgrid`, systemd `mqtt-bridge`): subscribes `microgrid/+/telemetry`, validates full schema, extracts `site_id` from payload, no allowlist → customer sites ingest with no code change.
-- Dashboard: Streamlit `127.0.0.1:8501` from `/opt/microgrid` (venv `.venv`), nginx `microgrid.tinylab.ai` proxies `/` + `/_stcore/stream` to 8501.
+- Dashboards: main Streamlit `127.0.0.1:8501` and customer-view `127.0.0.1:8502` (baseUrlPath `/c`), both from `/opt/microgrid` (venv `.venv`), nginx `microgrid.tinylab.ai` proxies `/` → 8501 and `/c/` → 8502.
+- Deploy note: the VM `/opt/microgrid` checkout is owned by `amplifiedengr` and the live `mqtt_to_pubsub.py` is untracked there — deploy **surgically (scp + restart), not `git pull`**.
 
 ## 13. Out of scope (v1)
 
-- Automated/self-service onboarding (intentionally manual).
-- More than one concurrent trial (sequential only).
+- Automated/self-service onboarding (intentionally manual; the onboarding *process* is sequential, though concurrently-running trials are fully supported and verified).
+- Hard VM-side cutoff of an already-connected gateway at T+12h (see §8 known gap).
 - Hardened dashboard authentication (capability-URL only).
 - Store-and-forward / offline buffering on the edge device.
 - Anomaly detection / AI triage for customer sites.
