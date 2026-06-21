@@ -1,0 +1,15 @@
+[Unit]
+Description=Microgrid Trial Gateway Forwarder
+After=network-online.target mosquitto.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/microgrid-gateway
+Environment=MICROGRID_GATEWAY_CONF=/opt/microgrid-gateway/gateway.conf
+ExecStart=/opt/microgrid-gateway/.venv/bin/python /opt/microgrid-gateway/forwarder.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,15 @@
+# Microgrid broker ACL
+# Installed at /etc/mosquitto/aclfile, referenced via `acl_file` in conf.d.
+#
+# Model: every authenticated device may publish only under its OWN site prefix
+# (%u = username). This isolates demo sites (site-NN), the hardware node
+# (hw-node-01) and customer trials (cust-<guid>) from each other, while the
+# bridge can read everything. No per-customer edits needed — the pattern rule
+# covers any future cust-<guid> automatically.
+
+# Bridge: read all telemetry for ingest.
+user mqtt-bridge
+topic read microgrid/#
+
+# Each device: publish only within its own subtree (telemetry, gps, etc.).
+pattern write microgrid/%u/#
