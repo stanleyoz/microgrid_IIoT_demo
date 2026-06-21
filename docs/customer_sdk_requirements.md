@@ -32,7 +32,21 @@ A single per-customer GUID (UUIDv4) provides:
 1. **Secure publisher identity.** MQTT username `cust-<guid>` + a generated secret password. A mosquitto **ACL locks this user to publishing only `microgrid/cust-<guid>/telemetry`** — they cannot read or write any other site's data.
 2. **Private-dashboard capability key.** The customer's dashboard is served at the unguessable URL `https://microgrid.tinylab.ai/c/<guid>/`, filtered to show only their site, labelled with the friendly `customer_name`.
 
-**`site_id` = `cust-<guid>`** (the GUID is the canonical site id under the hood; the friendly `customer_name` is display-only).
+**Identity model (multi-device per customer).** A customer account = one **GUID**. Each device under that account is a distinct site:
+
+- `site_id` / MQTT username = **`cust-<guid>-<NN>`** (device NN, zero-padded), password = per-device secret.
+- The broker ACL `pattern write microgrid/%u/#` isolates **every device** to its own topic — no per-device ACL edit.
+- The customer's dashboard `/c/<guid>` filters **`site_id LIKE 'cust-<guid>-%'`**, so it shows all of that customer's devices and nothing else.
+- The friendly `customer_name` is display-only.
+
+This makes the platform **zero-touch multi-tenant** after a one-time setup (ACL enable + single customer-view dashboard instance + one nginx `/c/` location):
+
+- **Scale up (happy customer):** `add_device` issues one more credential `cust-<guid>-<NN+1>`; it auto-appears on the existing dashboard via the prefix filter. No dashboard/nginx/VM reconfiguration.
+- **Off-board (unhappy customer):** `offboard_customer` removes every `cust-<guid>-*` credential, cancels their revocation timers, and deletes the registry entry — a full reversal of VM-side onboarding state. (BigQuery rows are left as an append-only audit trail by default; purge on request.)
+- **Concurrency:** N customers run simultaneously — distinct GUIDs, one shared dashboard instance, broker `%u` ACL keeps them isolated. Onboarding itself stays sequential (no overlap) by process, but running trials need not be.
+
+### Customer registry
+A small registry (one JSON file per customer at `/var/lib/microgrid-registry/<guid>.json`: `customer_name`, `status`, `created`, `expires`, `devices[]`) is the automation backbone: written at onboard, read by the dashboard to validate a GUID + show the friendly name, removed at off-board. File-based to avoid extra dependencies; a future onboarding API writes the same record.
 
 ### Security model & caveat
 Privacy is **capability-URL based** (the GUID is an unguessable secret in the path) plus per-user MQTT credentials + topic ACL over TLS. This is adequate for time-boxed sales trials. It is **not** a hardened auth system — there is no per-user login on the dashboard; anyone with the GUID URL can view that one site. Acceptable for v1; revisit if trials become long-lived or carry sensitive data.

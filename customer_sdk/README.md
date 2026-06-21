@@ -12,11 +12,13 @@ Full spec: [`docs/customer_sdk_requirements.md`](../docs/customer_sdk_requiremen
 - **Phase 1 — forwarder + local contract — DONE & tested** (this directory).
 - **Phase 2 — installer (`install.sh`, port-bump, systemd) — DONE & tested**
   (verified end-to-end in a clean Ubuntu 24.04 container).
-- **Phase 3 — VM provisioning scripts (mosquitto user + ACL + 12h revocation)
-  — BUILT & ACL-tested in isolation; NOT yet applied to the live broker.**
-  See `server/`. Applying `enable_acl.sh` to production is a live-impacting
-  step held for explicit operator approval.
-- Phase 4 — main-dashboard exclusion + scoped `/c/<guid>` dashboard — pending.
+- **Phase 3 — VM provisioning + multi-tenant lifecycle — BUILT & tested in
+  isolation; NOT yet applied to the live broker.** See `server/`. ACL and the
+  full lifecycle (onboard 3 customers × 2 devices, cross-isolation, scale-up,
+  off-board reversal) verified in a container. Applying `enable_acl.sh` to
+  production is a live-impacting step held for operator approval.
+- Phase 4 — main-dashboard `cust-*` exclusion + single multi-tenant `/c/<guid>`
+  dashboard (GUID-from-URL + registry) — pending (offline build next).
 - Phase 5 — bundle generator + end-to-end dry run — pending.
 
 ## Layout
@@ -35,9 +37,17 @@ test/
 server/               (run on the broker VM as root)
   aclfile             topic ACL: pattern write microgrid/%u/# + bridge read
   enable_acl.sh       ONE-TIME, live-impacting: enable ACL (backup + auto-rollback)
-  provision_customer.sh    add cust-<guid> credential + schedule 12h revocation
-  deprovision_customer.sh  delete credential + reload (auto-run at T+12h)
+  lib.sh              shared helpers (credentials, registry, revoke timers)
+  onboard_customer.sh      create customer GUID + N device credentials + registry
+  add_device.sh            scale up a customer with more device credentials
+  offboard_customer.sh     full reversal: remove all creds/timers/registry
+  deprovision_customer.sh  delete one device credential (12h timer target)
 ```
+
+Identity: customer = one GUID; devices = `cust-<guid>-<NN>`. Dashboard `/c/<guid>`
+filters `cust-<guid>-%`, so a customer sees all their devices and no one else's.
+Multi-tenant isolation, scale-up and off-board verified via
+`test/multitenant_test.sh` (3 customers × 2 devices in a container).
 
 ## Local contract (customer → local broker)
 
