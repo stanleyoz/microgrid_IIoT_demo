@@ -1,0 +1,24 @@
+[gateway]
+# ── Identity (filled in by the bundle generator) ──────────────────────────────
+site_id = cust-{{GUID}}
+customer_name = {{CUSTOMER_NAME}}
+
+# ── Local broker (this device) — install.sh updates local_broker_port if 1883
+#    is already in use ───────────────────────────────────────────────────────
+local_broker_host = 127.0.0.1
+local_broker_port = {{LOCAL_BROKER_PORT}}
+
+# ── tinylab VM broker (uplink) ────────────────────────────────────────────────
+vm_broker_host = {{VM_BROKER_HOST}}
+vm_broker_port = 8883
+mqtt_user = cust-{{GUID}}
+mqtt_pass = {{MQTT_SECRET}}
+ca_cert = ca.crt
+
+# ── Behaviour ─────────────────────────────────────────────────────────────────
+publish_interval_s = {{PUBLISH_INTERVAL_S}}
+trial_hours = {{TRIAL_HOURS}}
+
+# systemd integration (true on a real install; false for local testing)
+manage_service = false
+service_name = microgrid-gateway
