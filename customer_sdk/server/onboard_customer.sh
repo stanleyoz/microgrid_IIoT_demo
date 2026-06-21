@@ -25,7 +25,7 @@ echo "[*] Onboarded '$NAME' as customer $GUID (trial ${TRIAL_H}h)." >&2
 echo "{"
 echo "  \"customer_name\": \"$NAME\","
 echo "  \"guid\": \"$GUID\","
-echo "  \"dashboard_url\": \"/c/$GUID\","
+echo "  \"dashboard_url\": \"/c/?c=$GUID\","
 echo "  \"devices\": ["
 for i in $(seq 1 "$NDEV"); do
     IDX="$(next_device_index "$GUID")"

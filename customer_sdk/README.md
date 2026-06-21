@@ -17,8 +17,18 @@ Full spec: [`docs/customer_sdk_requirements.md`](../docs/customer_sdk_requiremen
   full lifecycle (onboard 3 customers × 2 devices, cross-isolation, scale-up,
   off-board reversal) verified in a container. Applying `enable_acl.sh` to
   production is a live-impacting step held for operator approval.
-- Phase 4 — main-dashboard `cust-*` exclusion + single multi-tenant `/c/<guid>`
-  dashboard (GUID-from-URL + registry) — pending (offline build next).
+- **Phase 4 — multi-tenant dashboard — DONE & tested offline.** `dashboard_app.py`
+  gains a scoped mode (`CUSTOMER_VIEW=1`): reads the GUID from `?c=<guid>`,
+  validates it against the registry, and filters every query to `cust-<guid>-%`;
+  the main dashboard now excludes `cust-*`. Customer URL: `/c/?c=<guid>`. Deploy
+  artifacts in `server/` (`customer-dashboard.service`, `nginx-customer-location.conf`).
+  Verified offline: scope SQL unit test, live-BQ scoping (main=11 demo sites,
+  customer=prefix-only), per-GUID cache keying, and both modes boot clean.
+
+### Remaining: one supervised live window (operator approval)
+Enable ACL (`server/enable_acl.sh`) + stand up the customer-view instance
+(`customer-dashboard.service` on :8502) + paste the nginx `/c/` block once, then
+verify live ingest unchanged. After that, onboarding is fully scripted.
 - Phase 5 — bundle generator + end-to-end dry run — pending.
 
 ## Layout

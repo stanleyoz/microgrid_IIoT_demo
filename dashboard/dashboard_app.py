@@ -1,5 +1,7 @@
 import time
 import os
+import re
+import json
 import requests
 import pandas as pd
 import plotly.graph_objects as go
@@ -17,6 +19,44 @@ DISPATCH_AGENT_URL = os.getenv(
 
 PROJECT_ID = os.getenv("GCP_PROJECT_ID", "microgrid-demo")
 DATASET = "microgrid_db"
+
+# ── Multi-tenant scope ─────────────────────────────────────────────────────────
+# One Streamlit process serves the main demo dashboard OR (when CUSTOMER_VIEW=1)
+# the per-customer view at /c/<guid>. The GUID arrives as a URL query param and
+# is validated against the file-based registry; every query is scoped so a
+# customer sees only their own devices and the main dashboard hides customer
+# sites. The active GUID is threaded into cached queries so cache entries never
+# leak across customers.
+CUSTOMER_VIEW = os.getenv("CUSTOMER_VIEW", "").lower() in ("1", "true", "yes")
+REGISTRY_DIR  = os.getenv("REGISTRY_DIR", "/var/lib/microgrid-registry")
+_GUID_RE = re.compile(r"^[0-9a-fA-F]{6,40}$")
+
+def scope_sql(guid, col="site_id"):
+    """SQL predicate restricting a query to the correct sites.
+    Customer view → only that customer's devices (cust-<guid>-%).
+    Main demo dashboard → exclude all customer sites."""
+    if guid:
+        return f"{col} LIKE 'cust-{guid}-%'"
+    return f"{col} NOT LIKE 'cust-%'"
+
+def resolve_customer():
+    """Read + validate the GUID from the URL (?c=<guid>) against the registry.
+    Returns (guid, customer_name); renders an error page and stops otherwise."""
+    guid = st.query_params.get("c")
+    if isinstance(guid, list):
+        guid = guid[0] if guid else None
+    if not guid or not _GUID_RE.match(guid):
+        st.error("Missing or malformed trial id."); st.stop()
+    path = os.path.join(REGISTRY_DIR, f"{guid}.json")
+    if not os.path.exists(path):
+        st.error("Unknown or expired trial."); st.stop()
+    try:
+        rec = json.load(open(path))
+    except Exception:
+        st.error("Trial registry unreadable."); st.stop()
+    if rec.get("status") != "active":
+        st.error("This trial is no longer active."); st.stop()
+    return guid, rec.get("customer_name", guid)
 
 BLUE        = "#0A6EBD"
 BLUE_MID    = "#3498DB"
@@ -136,12 +176,13 @@ def _to_sgt(df):
     return df
 
 @st.cache_data(ttl=30)
-def fleet_latest():
+def fleet_latest(guid=None):
     q = f"""
     SELECT * EXCEPT(rn) FROM (
         SELECT *, ROW_NUMBER() OVER (PARTITION BY site_id ORDER BY timestamp DESC) AS rn
         FROM `{PROJECT_ID}.{DATASET}.microgrid_telemetry`
         WHERE timestamp > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 15 MINUTE)
+          AND {scope_sql(guid)}
     ) WHERE rn = 1 ORDER BY site_id
     """
     df = client.query(q).to_dataframe()
@@ -161,13 +202,14 @@ def site_history(site_id, hours=24):
     return _to_sgt(df)
 
 @st.cache_data(ttl=15)
-def fetch_agent_activity():
+def fetch_agent_activity(guid=None):
     """Returns (is_active, last_event) — active if triage agent fired in last 5 min."""
     q = f"""
     SELECT site_id, timestamp, fault_type, severity, agent_summary
     FROM `{PROJECT_ID}.{DATASET}.anomaly_events`
     WHERE agent_summary LIKE '[AI Triage]%'
       AND timestamp > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 5 MINUTE)
+      AND {scope_sql(guid)}
     ORDER BY timestamp DESC
     LIMIT 1
     """
@@ -182,7 +224,7 @@ def fetch_agent_activity():
 
 
 @st.cache_data(ttl=20)
-def fetch_pending_acks():
+def fetch_pending_acks(guid=None):
     """Unacknowledged critical + high alerts requiring operator action."""
     q = f"""
     SELECT a.site_id, a.timestamp, a.fault_type, a.severity, a.anomaly_score, a.agent_summary
@@ -193,6 +235,7 @@ def fetch_pending_acks():
     WHERE k.site_id IS NULL
       AND a.severity IN ('critical', 'high')
       AND a.agent_summary LIKE '[AI Triage]%'
+      AND {scope_sql(guid, 'a.site_id')}
       AND a.timestamp > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 6 HOUR)
     ORDER BY
         CASE a.severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 ELSE 2 END,
@@ -206,8 +249,11 @@ def fetch_pending_acks():
 
 
 @st.cache_data(ttl=30)
-def fetch_anomalies(site_id=None, limit=300):
-    where = f"WHERE site_id = '{site_id}'" if site_id else ""
+def fetch_anomalies(site_id=None, limit=300, guid=None):
+    conds = [scope_sql(guid)]
+    if site_id:
+        conds.append(f"site_id = '{site_id}'")
+    where = "WHERE " + " AND ".join(conds)
     q = f"""
     SELECT timestamp, site_id, anomaly_score, fault_type, severity, agent_summary, acknowledged
     FROM `{PROJECT_ID}.{DATASET}.anomaly_events`
@@ -278,23 +324,33 @@ def html_table(headers, rows_html):
 
 TR = f'style="border-bottom:1px solid {BORDER}"'
 
+# ── Resolve multi-tenant scope for this session ───────────────────────────────
+# ACTIVE_GUID = None → main demo dashboard (customer sites excluded).
+# ACTIVE_GUID = <guid> → customer view (only that customer's devices).
+if CUSTOMER_VIEW:
+    ACTIVE_GUID, CUSTOMER_NAME = resolve_customer()
+else:
+    ACTIVE_GUID, CUSTOMER_NAME = None, None
+
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown(f"<h2 style='color:{BLUE};border:none;margin-bottom:2px'>⚡ Microgrid Ops</h2>",
+    _title = CUSTOMER_NAME if CUSTOMER_VIEW else "Microgrid Ops"
+    st.markdown(f"<h2 style='color:{BLUE};border:none;margin-bottom:2px'>⚡ {_title}</h2>",
                 unsafe_allow_html=True)
-    st.caption("tinylab.ai · Amplified Engineering")
+    st.caption(f"{CUSTOMER_NAME} · powered by tinylab.ai" if CUSTOMER_VIEW
+               else "tinylab.ai · Amplified Engineering")
     st.divider()
-    page = st.radio("Navigation",
-                    ["Fleet Overview", "Site Details", "Anomaly Monitor",
-                     "Operator Chat", "Settings"],
-                    label_visibility="collapsed")
+    _pages = (["Fleet Overview", "Site Details"] if CUSTOMER_VIEW
+              else ["Fleet Overview", "Site Details", "Anomaly Monitor",
+                    "Operator Chat", "Settings"])
+    page = st.radio("Navigation", _pages, label_visibility="collapsed")
     st.divider()
     refresh = st.select_slider("Auto-refresh (s)", [15, 30, 60, 120, 300], value=30)
     anomaly_threshold = st.slider("Anomaly sensitivity", 0.01, 0.20, 0.05, 0.01,
                                   help="Isolation Forest contamination parameter")
     st.divider()
     st.markdown("**AI Agent Status**")
-    is_active, last_event = fetch_agent_activity()
+    is_active, last_event = fetch_agent_activity(ACTIVE_GUID)
     if is_active:
         st.markdown(
             f'<div class="agent-panel">'
@@ -323,7 +379,7 @@ with st.sidebar:
     if "local_acks" not in st.session_state:
         st.session_state.local_acks = set()
 
-    pending_acks = fetch_pending_acks()
+    pending_acks = fetch_pending_acks(ACTIVE_GUID)
     # Filter out locally-acknowledged items — BQ streaming buffer may lag a few seconds
     if not pending_acks.empty and st.session_state.local_acks:
         pending_acks = pending_acks[
@@ -389,8 +445,8 @@ with st.sidebar:
 if page == "Fleet Overview":
     st.markdown("## Fleet Overview")
 
-    df = fleet_latest()
-    an = fetch_anomalies(limit=500)
+    df = fleet_latest(ACTIVE_GUID)
+    an = fetch_anomalies(limit=500, guid=ACTIVE_GUID)
 
     df = require_telemetry(df)
 
@@ -463,7 +519,7 @@ if page == "Fleet Overview":
 elif page == "Site Details":
     st.markdown("## Site Details")
 
-    df_fleet = require_telemetry(fleet_latest(), empty_msg="No live data available.")
+    df_fleet = require_telemetry(fleet_latest(ACTIVE_GUID), empty_msg="No live data available.")
 
     col_sel, col_hrs = st.columns([2, 1])
     with col_sel:
@@ -570,7 +626,7 @@ elif page == "Site Details":
         st.plotly_chart(fig_bal, width='stretch') #use_container_width=True)
 
     st.markdown("### Recent Anomalies")
-    an = fetch_anomalies(site_id=site, limit=20)
+    an = fetch_anomalies(site_id=site, limit=20, guid=ACTIVE_GUID)
     if not an.empty:
         rows = ""
         for _, r in an.iterrows():
@@ -594,7 +650,7 @@ elif page == "Site Details":
 elif page == "Anomaly Monitor":
     st.markdown("## Anomaly Monitor")
 
-    an = fetch_anomalies(limit=500)
+    an = fetch_anomalies(limit=500, guid=ACTIVE_GUID)
     if an.empty:
         st.info("No anomaly events recorded yet.")
         st.stop()

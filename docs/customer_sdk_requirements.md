@@ -135,12 +135,14 @@ See §8.
 
 ## 9. Private dashboard (scoped Streamlit)
 
-- Reuse `dashboard/dashboard_app.py` in a **scoped mode** driven by env vars:
-  - `SITE_FILTER=cust-<guid>` — every query restricted to this site; site selector hidden; fleet-wide pages reduced to the single site.
-  - `CUSTOMER_NAME="Acme Solar"` — friendly title.
-- Run a second Streamlit instance on `127.0.0.1:8502` with `--server.baseUrlPath=/c/<guid>`.
-- Add an nginx `location /c/<guid>/` block (+ matching `/_stcore/stream` subpath) proxying to `:8502`.
-- **Sequential onboarding** ⇒ a single scoped instance/port (`8502`) is reconfigured per trial; teardown removes the nginx block and stops the instance.
+**Single multi-tenant instance (zero per-customer config).** Reuse `dashboard/dashboard_app.py` in a **scoped mode** via `CUSTOMER_VIEW=1`:
+  - Reads the GUID from the URL query string (`?c=<guid>`), validates it against the registry (`REGISTRY_DIR`), and scopes **every** query to `cust-<guid>-%`. The active GUID is threaded into the cached query functions so cache entries never leak across customers.
+  - Shows the friendly `customer_name`; nav reduced to Fleet Overview + Site Details (agents are off for customer sites).
+- **One** Streamlit instance on `127.0.0.1:8502` with `--server.baseUrlPath=/c` (`server/customer-dashboard.service`), and **one** nginx `location /c/` block added once (`server/nginx-customer-location.conf`).
+- Customer URL: **`https://microgrid.tinylab.ai/c/?c=<guid>`**. Onboarding a new customer requires **no** dashboard/nginx changes — just hand over the URL.
+
+### Main dashboard change
+- All fleet queries gain `AND site_id NOT LIKE 'cust-%'` (via the same `scope_sql(None)` helper) so customer sites never appear on the public demo dashboard.
 
 ### Main dashboard change
 - `fleet_latest()` and other fleet queries: add `WHERE site_id NOT LIKE 'cust-%'` so customer sites are excluded from the public demo dashboard.
